@@ -31,7 +31,7 @@ def resize_image_worker(input_path, output_path, size, resample_filter, output_f
             return "ERROR", f"Failed to process {input_path.name} after {max_retries} attempts: {e}"
 
 class Resizer:
-    def __init__(self, input_dir="../dataset/clean_images", output_dir="../dataset/resized_images", 
+    def __init__(self, input_dir="dataset/clean_images", output_dir="dataset/resized_images", 
             width=384, height=512, output_format="PNG", max_workers=4, 
             max_retries=3, overwrite=False):
         
