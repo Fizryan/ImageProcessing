@@ -21,9 +21,9 @@ LOGGING_CONFIG = {
         'file': {
             'class': 'logging.handlers.RotatingFileHandler',
             'formatter': 'standard',
-            'filename': 'app.log',
+            'filename': 'logs/app.log',
             'maxBytes': 10485760,
-            'backupCount': 5,
+            'backupCount': 1,
             'encoding': 'utf8',
             'level': 'DEBUG',
         },
