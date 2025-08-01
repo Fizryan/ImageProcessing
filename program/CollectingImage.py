@@ -9,8 +9,8 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class CollectingImage:
-    def __init__(self, image_url="https://picsum.photos", save_path="../dataset/clean_images", 
-                 count=10, width=3060, height=4080, max_workers=5, max_retries=3):
+    def __init__(self, image_url="https://picsum.photos", save_path="dataset/clean_images", 
+                 count=10, width=3060, height=4080, max_workers=4, max_retries=3):
         self.image_url = image_url
         self.save_path = Path(save_path)
         self.count = count
@@ -56,7 +56,7 @@ class CollectingImage:
         results = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(self._get_image, idx): idx for idx in indices}
-            for future in tqdm(as_completed(futures), total=len(indices), desc="Downloading", ncols=100):
+            for future in tqdm(as_completed(futures), total=len(indices), desc="Downloading", ncols=100, leave=False):
                 success, message = future.result()
                 index = futures[future]
                 results[index] = success
@@ -67,25 +67,40 @@ class CollectingImage:
         return results
 
     def download_images(self):
-        self.logger.info(f"Starting threaded download of {self.count} images using {self.max_workers} workers.")
+        self.logger.info(f"Starting download of {self.count} images using up to {self.max_workers} workers.")
 
-        all_indices = [self.start_index + i + 1 for i in range(self.count)]
-        retry_count = 0
-        failed_indices = all_indices
+        indices_to_download = [self.start_index + i + 1 for i in range(self.count)]
+        successful_downloads = 0
+        
+        pbar = tqdm(total=self.count, desc="Overall Progress", ncols=100)
+        
+        for attempt in range(self.max_retries + 1):
+            if not indices_to_download:
+                self.logger.info("All images have been downloaded.")
+                break
 
-        while retry_count <= self.max_retries and failed_indices:
-            self.logger.info(f"Attempt {retry_count + 1}/{self.max_retries + 1} - Downloading {len(failed_indices)} images.")
-            results = self._download_batch(failed_indices)
-            failed_indices = [idx for idx, success in results.items() if not success]
-            retry_count += 1
-            if failed_indices and retry_count <= self.max_retries:
-                self.logger.warning(f"Retrying {len(failed_indices)} failed images...")
+            self.logger.info(f"Attempt {attempt + 1}/{self.max_retries + 1} - Downloading {len(indices_to_download)} images.")
+            
+            batch_results = self._download_batch(indices_to_download)
+            
+            newly_failed = []
+            for index, success in batch_results.items():
+                if success:
+                    successful_downloads += 1
+                    pbar.update(1)
+                else:
+                    newly_failed.append(index)
+            
+            indices_to_download = newly_failed
+            
+            if indices_to_download and attempt < self.max_retries:
+                self.logger.warning(f"Retrying {len(indices_to_download)} failed images in 2 seconds...")
                 time.sleep(2)
+        
+        pbar.close()
 
-        successful = self.count - len(failed_indices)
-        if failed_indices:
-            self.logger.error(f"Only {successful}/{self.count} images downloaded after {self.max_retries} retries.")
-            self.logger.error(f"Failed image indices: {failed_indices}")
-            time.sleep(1)
+        if indices_to_download:
+            self.logger.error(f"Operation finished. Only {successful_downloads}/{self.count} images were downloaded.")
+            self.logger.error(f"Failed image indices: {indices_to_download}")
         else:
-            self.logger.info(f"Successfully downloaded all {self.count} images to {self.save_path}.")
+            self.logger.info(f"Successfully downloaded all {self.count} images.")
