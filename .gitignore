@@ -1,2 +1,24 @@
+# .gitignore for ImageProcessing
+
+# Files and directories to ignore in the ImageProcessing
 /dataset
+/Training
+/logs
+/Results
+/Samples
+
+# Python virtual environment
+venv/
+.env
 /venv
+
+# log files
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Python cache files
+__pycache__
+*.pyc
