@@ -47,9 +47,9 @@ def process_image_worker(image_path, output_dir, noise_type, noise_level, seed, 
             return "ERROR", f"Failed to process {image_path.name} after {max_retries} attempts: {e}"
 
 class NoiseGenerator:
-    def __init__(self, clean_dir="../dataset/clean_images", noise_dir="../dataset/noisy_images", 
+    def __init__(self, input_dir="dataset/clean_images", noise_dir="dataset/noisy_images", 
                  noise_level=0.1, noise_type='random', max_workers=4, max_retries=3, overwrite=False):
-        self.clean_dir = Path(clean_dir)
+        self.input_dir = Path(input_dir)
         self.noise_dir = Path(noise_dir)
         self.noise_level = noise_level
         self.noise_type = noise_type
@@ -92,7 +92,7 @@ class NoiseGenerator:
 
     def generate_noisy_images(self):
         allowed_extensions = {".png", ".jpg", ".jpeg"}
-        image_files = [p for p in self.clean_dir.iterdir() if p.suffix.lower() in allowed_extensions]
+        image_files = [p for p in self.input_dir.iterdir() if p.suffix.lower() in allowed_extensions]
         self.logger.info(f"Found {len(image_files)} images to process.")
 
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
