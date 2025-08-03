@@ -17,7 +17,7 @@ TRAINING_CONFIG = {
     'compile_mode': 'reduce-overhead', # Options: 'default', 'reduce-overhead', 'max-autotune'
     'max_gpu_temp': 85,
     'dataloader_params': {
-        'batch_size': 2, # Adjust based on GPU memory
+        'batch_size': 3, # Adjust based on GPU memory
         'shuffle': True,
         'num_workers': 4,
         'pin_memory': True,
