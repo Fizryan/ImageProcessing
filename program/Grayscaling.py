@@ -55,7 +55,7 @@ class Grayscaler:
         self.logger = logging.getLogger(__name__)
 
         if self.output_format:
-            self.output_format = Image.Image.registered_extensions().get(f".{self.output_format.lower()}", self.output_format.upper())
+            self.output_format = Image.registered_extensions().get(f".{self.output_format.lower()}", self.output_format.upper())
             if self.output_format not in Image.SAVE:
                 raise ValueError(f"Output format '{self.output_format}' is not supported by Pillow.")
         
