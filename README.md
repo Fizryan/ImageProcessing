@@ -1,3 +1,7 @@
+[![GitHub Issues](https://img.shields.io/github/issues/Fizryan/ImageProcessing)](https://github.com/Fizryan/ImageProcessing/issues)
+[![GitHub repo size](https://img.shields.io/github/repo-size/Fizryan/ImageProcessing?color=tomato)](https://github.com/Fizryan/ImageProcessing)
+[![GitHub watchers](https://img.shields.io/github/watchers/Fizryan/ImageProcessing)](https://github.com/Fizryan/ImageProcessing/watchers)
+[![GitHub stars](https://img.shields.io/github/stars/Fizryan/ImageProcessing)](https://github.com/Fizryan/ImageProcessing/stargazers)
 # Image Restoration Pipeline
 
 An end-to-end, PyTorch-based pipeline for training and deploying deep learning models for various image restoration tasks. This project provides a complete workflow from data collection and preparation to model training and inference, all managed through a simple and interactive command-line interface.
