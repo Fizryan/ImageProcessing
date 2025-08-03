@@ -55,8 +55,10 @@ def handle_noise():
     input_dir = get_user_input("Input directory", "dataset/resized_images")
     output_dir = get_user_input("Output directory", "dataset/noisy_images")
     noise_level = get_user_input("Noise level (0.0 to 1.0)", 0.1, float)
+    overwrite = get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == 'yes'
+    overwrite = True if overwrite else False
 
-    noiser = NoiseGenerator(input_dir=input_dir, noise_dir=output_dir, noise_level=noise_level)
+    noiser = NoiseGenerator(input_dir=input_dir, noise_dir=output_dir, noise_level=noise_level, overwrite=overwrite)
     noiser.generate_noisy_images()
 
 def handle_grayscale():
@@ -64,8 +66,10 @@ def handle_grayscale():
     input_dir = get_user_input("Input directory", "dataset/resized_images")
     output_dir = get_user_input("Output directory", "dataset/grayscale_images")
     output_format = get_user_input("Output format (e.g., PNG, JPEG, or leave empty to keep original)", "PNG")
+    overwrite = get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == 'yes'
+    overwrite = True if overwrite else False
     
-    grayscaler = Grayscaler(input_dir=input_dir, output_dir=output_dir, output_format=output_format or None)
+    grayscaler = Grayscaler(input_dir=input_dir, output_dir=output_dir, output_format=output_format or None, overwrite=overwrite)
     grayscaler.process_images()
 
 def handle_mosaic():
@@ -73,7 +77,9 @@ def handle_mosaic():
     input_dir = get_user_input("Input directory", "dataset/resized_images")
     output_dir = get_user_input("Output directory", "dataset/mosaic_images")
     block_size = get_user_input("Block size for mosaic effect", 25, int)
-    mosaic_gen = MosaicGenerator(input_dir=input_dir, output_dir=output_dir, block_size=block_size)
+    overwrite = get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == 'yes'
+    overwrite = True if overwrite else False
+    mosaic_gen = MosaicGenerator(input_dir=input_dir, output_dir=output_dir, block_size=block_size, overwrite=overwrite)
     mosaic_gen.generate_mosaic_images()
 
 def handle_training():
@@ -95,6 +101,43 @@ def handle_inference():
     restored_image = restorer.restore_image_from_path(input_path=input_path, output_path=output_path, task_type=task_type)
     logger.info(f"Inference completed.")
 
+def handle_dataset():
+    logger.info("Starting dataset preparation process...")
+    input_dir = get_user_input("Input directory for dataset", "dataset")
+    output_dir = get_user_input("Output directory for dataset", "dataset")
+
+    input_user = get_user_input("download new images? (yes/no)", "no", str).lower() == 'yes'
+    if input_user:
+        logger.info("Starting image download process...")
+        count = get_user_input("Number of images to download", 20, int)
+        collector = CollectingImage(count=count, max_workers=5, save_path=output_dir+"/clean_images")
+        collector.download_images()
+    
+    overwrite = get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == 'yes'
+    overwrite = True if overwrite else False
+
+    logger.info("Starting image resizing process...")
+    width = get_user_input("Target width", 384, int)
+    height = get_user_input("Target height", 512, int)
+    resizer = Resizer(input_dir=input_dir+"/clean_images", output_dir=output_dir+"/resized_images", width=width, height=height, overwrite=overwrite)
+    resizer.process_images()
+
+    logger.info("Starting noise generation process...")
+    noise_level = get_user_input("Noise level (0.0 to 1.0)", 0.1, float)
+    noiser = NoiseGenerator(input_dir=input_dir+"/resized_images", noise_dir=output_dir+"/noisy_images", noise_level=noise_level, overwrite=overwrite)
+    noiser.generate_noisy_images()
+
+    logger.info("Starting mosaic image generation process...")
+    block_size = get_user_input("Block size for mosaic effect (1 to 100)", 5, int)
+    mosaic_gen = MosaicGenerator(input_dir=input_dir+"/resized_images", output_dir=output_dir+"/mosaic_images", block_size=block_size, overwrite=overwrite)
+    mosaic_gen.generate_mosaic_images()
+
+    logger.info("Starting grayscale conversion process...")
+    output_format = get_user_input("Output format (e.g., PNG, JPEG, or leave empty to keep original)", "PNG")
+    grayscaler = Grayscaler(input_dir=input_dir+"/resized_images", output_dir=output_dir+"/grayscale_images", output_format=output_format or None, overwrite=overwrite)
+    grayscaler.process_images()
+
+
 def display_menu():
     print("\n" + "="*28)
     print("      IMAGE PROCESSING")
@@ -106,6 +149,7 @@ def display_menu():
     print("  5. Generate Mosaic Images")
     print("  6. Train Model")
     print("  7. Run Inference (Image Restoration)")
+    print("  8. Prepare Dataset")
     print("  0. Exit")
     print("="*28)
 
@@ -120,12 +164,13 @@ def main():
         "4": handle_grayscale,
         "5": handle_mosaic,
         "6": handle_training,
-        "7": handle_inference
+        "7": handle_inference,
+        "8": handle_dataset
     }
 
     while True:
         display_menu()
-        choice = input("Enter your choice (0-7): ").strip()
+        choice = input("Enter your choice (0-8): ").strip()
 
         if choice == '0':
             logger.info("Exiting program. Goodbye!")
