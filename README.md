@@ -7,9 +7,11 @@ An end-to-end, PyTorch-based pipeline for training and deploying deep learning m
 -   **End-to-End Workflow**: Integrated tools for every step: downloading images, preprocessing, training, and inference.
 -   **Multi-Task Restoration**: Capable of handling several common image corruptions:
     -   **Denoising**: Removing random noise from images.
-    -   **Demosaicing**: Reconstructing images from mosaic patterns.
+    -   **Mosaic Restoration**: Reconstructing images from mosaic patterns.
+    -   **Blur Removal**: Sharpening blurry images.
     -   **Inpainting**: Filling in missing or corrupted parts of an image.
--   **Advanced U-Net Architecture**: Utilizes a powerful and efficient U-Net model (`AdvancedUNet`) for high-quality image reconstruction.
+    -   *(Also includes separate utilities for grayscale conversion and image resizing)*
+-   **Advanced U-Net Architecture**: Utilizes a powerful and efficient `AdvancedUNet` model for high-quality image reconstruction.
 -   **High-Performance Training**: Optimized for speed and efficiency with:
     -   Mixed-Precision Training (AMP) on CUDA devices.
     -   `torch.compile` for model optimization (for PyTorch 2.0+).
@@ -25,21 +27,23 @@ ImageProcessing/
 ├── dataset/                # Default location for image data
 │   ├── clean_images/
 │   ├── resized_images/
-│   ├── noisy_images/
-│   ├── mosaic_images/
-│   └── inpainting_images/
+│   ├── noisy_images/       # Generated noisy images
+│   ├── mosaic_images/      # Generated mosaic images
+│   ├── blurry_images/      # Generated blurry images
+│   └── grayscale_images/   # Generated grayscale images
 ├── logs/                   # Generated log files
 ├── program/                # Main source code modules
 │   ├── Architecture.py     # Model architecture definition
+│   ├── BlurGenerator.py    # Blur image generation script
 │   ├── CollectingImage.py  # Image Data collection script
+│   ├── Grayscaling.py      # Grayscale conversion script
 │   ├── Inference.py        # Inference script
 │   ├── Mosaic.py           # Mosaic image generation script
 │   ├── Noise.py            # Noise image generation script
 │   ├── Resizing.py         # Image resizing script
 │   ├── Training.py         # Training script
-│   ├── Training_Config.py  # Main configuration for training
-│   ├── Logging_Config.py   # Log configuration for logging
-│   └── ...
+│   ├── Training_Config.py  # Configuration for training
+│   └── Logging_Config.py   # Configuration for logging
 ├── Results/                # Default output directory for inference
 ├── Samples/                # Sample images for testing inference
 ├── Training/               # Training artifacts
@@ -79,7 +83,7 @@ Follow these instructions to set up and run the project on your local machine.
     source venv/bin/activate
     ```
 
-4.  **Install PyTorch:**
+3.  **Install PyTorch:**
     The project requires PyTorch. Please visit the official PyTorch website to get the correct installation command for your system (e.g., CPU or a specific CUDA version).
 
     *Example for CUDA 12.1:*
@@ -87,7 +91,7 @@ Follow these instructions to set up and run the project on your local machine.
     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
     ```
 
-5.  **Install other dependencies:**
+4.  **Install other dependencies:**
     Once PyTorch is installed, install the remaining packages from `requirements.txt`.
     ```bash
     pip install -r requirements.txt
@@ -107,29 +111,29 @@ This will launch an interactive menu where you can select the desired action.
 
 A typical workflow involves preparing the dataset, training the model, and finally running inference.
 
-#### 1. Prepare the Dataset (Option 8)
+#### 1. Prepare the Dataset (Option 9)
 
 This is the recommended first step. This option runs a complete data preparation pipeline that will prompt you for configuration:
 1.  **Download Images**: Downloads a specified number of high-quality images to `dataset/clean_images`.
 2.  **Resize Images**: Resizes the clean images to the model's input dimensions and saves them to `dataset/resized_images`.
-3.  **Generate Corruptions**: Creates noisy and mosaic versions of the resized images, placing them in their respective directories (`dataset/noisy_images`, `dataset/mosaic_images`, etc.).
-*Note: The `inpainting` task uses grayscale images as a stand-in for images with missing parts. This step also generates them.*
+3.  **Generate Corruptions**: Creates various corrupted versions of the resized images (`noisy`, `mosaic`, `blurry`, `grayscale`) and places them in their respective directories.
+*Note: The automated script does not generate data for the `inpainting` task. For this, you will need to manually create images with masked/blacked-out regions and configure the path in `program/Training_Config.py`.*
 
-#### 2. Train the Model (Option 6)
+#### 2. Train the Model (Option 7)
 
-Once the dataset is ready, you can start training.
+Once the dataset is ready, you can start training the model.
 -   This option uses the configuration defined in `program/Training_Config.py`. You can modify this file to change hyperparameters like learning rate, batch size, and number of epochs.
 -   The trainer automatically looks for datasets in the directories specified in the config.
 -   Training progress is saved continuously. You can stop (`Ctrl+C`) and resume training at any time.
 -   Checkpoints are saved in `Training/checkpoints/`, with `best_model.pth` being the model with the lowest validation loss.
 -   Visual previews of the model's performance are saved in `Training/previews/`.
 
-#### 3. Run Inference (Option 7)
+#### 3. Run Inference (Option 8)
 
 After training, use the best model to restore corrupted images.
 -   You will be prompted for:
     -   The path to the trained model (e.g., `Training/checkpoints/best_model.pth`).
-    -   The path to the input image you want to restore.
+    -   The path to the input image or directory you want to restore.
     -   The path for the saved, restored output image.
     -   The `task_type` (e.g., `noise`, `mosaic`, `inpainting`) to help the model process the input correctly.
 
