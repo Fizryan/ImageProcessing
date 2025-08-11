@@ -11,7 +11,7 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
+from torchvision import models, transforms
 from torchvision.utils import make_grid, save_image
 from tqdm.auto import tqdm
 import os
@@ -25,6 +25,26 @@ except ImportError:
 
 from program.Architecture import AdvancedUNet
 
+class PerceptualLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        vgg19 = models.vgg19(weights=models.VGG19_Weights.IMAGENET1K_V1).features[:18].eval()
+        for param in vgg19.parameters():
+            param.requires_grad = False
+        self.vgg = vgg19
+        self.criterion = nn.L1Loss()
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, source, target):
+        source_denorm = (source + 1) / 2
+        target_denorm = (target + 1) / 2
+        source_norm = (source_denorm - self.mean) / self.std
+        target_norm = (target_denorm - self.mean) / self.std
+        source_features = self.vgg(source_norm)
+        target_features = self.vgg(target_norm)
+        return self.criterion(source_features, target_features)
+
 class CombinedRestorationDataset(Dataset):
     def __init__(
         self,
@@ -32,6 +52,7 @@ class CombinedRestorationDataset(Dataset):
         noise_dir: Path,
         mosaic_dir: Path,
         inpainting_dir: Path,
+        blur_dir: Path,
         image_size: Tuple[int, int],
         cache_limit: int = 100
     ):
@@ -50,36 +71,26 @@ class CombinedRestorationDataset(Dataset):
             self.task_list.extend([
                 {'clean_path': path, 'task': 'noise', 'corrupted_path': noise_dir/path.name},
                 {'clean_path': path, 'task': 'mosaic', 'corrupted_path': mosaic_dir/path.name},
-                {'clean_path': path, 'task': 'inpainting', 'corrupted_path': inpainting_dir/path.name}
+                {'clean_path': path, 'task': 'inpainting', 'corrupted_path': inpainting_dir/path.name},
+                {'clean_path': path, 'task': 'blur', 'corrupted_path': blur_dir/path.name}
             ])
         
         logging.info(f"Dataset initialized with {len(self.task_list)} tasks. Cache limit: {cache_limit} items.")
 
-    def __len__(self):
-        return len(self.task_list)
+    def __len__(self): return len(self.task_list)
 
     def __getitem__(self, idx):
         task_info = self.task_list[idx]
         cache_key = task_info['corrupted_path']
-        
-        if cache_key in self.cache:
-            return self.cache[cache_key]
-            
+        if cache_key in self.cache: return self.cache[cache_key]
         try:
             clean_tensor = self.transform(Image.open(task_info['clean_path']).convert('RGB'))
             corrupted_tensor = self.transform(Image.open(task_info['corrupted_path']).convert('RGB'))
-            
             mask = (corrupted_tensor.sum(dim=0) == 0).float().unsqueeze(0) if task_info['task'] == 'inpainting' else torch.zeros(1, *self.image_size)
-            
             model_input = torch.cat([corrupted_tensor, mask], dim=0)
-            
-            result = (model_input * 2.0 - 1.0, clean_tensor * 2.0 - 1.0)
-            
-            if len(self.cache) < self.cache_limit:
-                self.cache[cache_key] = result
-            
+            result = ((model_input * 2.0 - 1.0), (clean_tensor * 2.0 - 1.0))
+            if len(self.cache) < self.cache_limit: self.cache[cache_key] = result
             return result
-            
         except Exception as e:
             logging.error(f"Error loading {task_info['corrupted_path']}: {e}")
             return torch.zeros(4, *self.image_size), torch.zeros(3, *self.image_size)
@@ -99,14 +110,6 @@ class Trainer:
         self._initialize_training_components()
         self._load_checkpoint()
         self._check_gpu_temp()
-        self.train_summary = {
-            'Best Loss': self.best_loss,
-            'Last Loss': 0.0,
-            'Learning Rate': self.config['learning_rate'],
-            'Epochs': 0,
-            'Time': 0.0
-        }
-        self.logger.info(f"Trainer initialized with config: {self.config}")
         
     def _setup_directories(self):
         Path(self.config['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
@@ -131,20 +134,12 @@ class Trainer:
             noise_dir=Path(self.config['data_dirs']['noise']),
             mosaic_dir=Path(self.config['data_dirs']['mosaic']),
             inpainting_dir=Path(self.config['data_dirs']['inpainting']),
+            blur_dir=Path(self.config['data_dirs']['blur']),
             image_size=image_size,
             cache_limit=self.config.get('cache_limit', 200)
         )
         
-        self.dataloader = DataLoader(
-            dataset,
-            batch_size=self.config['dataloader_params']['batch_size'],
-            shuffle=True,
-            num_workers=min(os.cpu_count(), self.config.get('num_workers', 4)),
-            pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2
-        )
-        
+        self.dataloader = DataLoader(dataset, **self.config['dataloader_params'])
         model = AdvancedUNet(in_channels=4, out_channels=3).to(self.device)
         self.logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} trainable parameters.")
 
@@ -154,38 +149,30 @@ class Trainer:
         
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.config['learning_rate'], weight_decay=1e-4)
         self.scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=3)
-        self.criterion = nn.L1Loss()
+        
+        self.criterion_l1 = nn.L1Loss()
+        self.criterion_perceptual = PerceptualLoss().to(self.device)
+        
         self.use_amp = self.device.type == 'cuda'
         self.scaler = GradScaler(enabled=self.use_amp)
         self.logger.info(f"AMP {'enabled' if self.use_amp else 'disabled'}.")
 
     def _load_checkpoint(self):
-        self.start_epoch = 0
-        self.best_loss = float('inf')
+        self.start_epoch = 0; self.best_loss = float('inf')
         checkpoint_path = Path(self.config['checkpoint_dir']) / 'last_checkpoint.pth'
-        
-        if not checkpoint_path.exists():
-            self.logger.info("No checkpoint found, starting fresh.")
-            return
-            
+        if not checkpoint_path.exists(): self.logger.info("No checkpoint found, starting fresh."); return
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             self.model.load_state_dict(checkpoint['model_state_dict'])
             self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             if self.use_amp: self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
             self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            self.start_epoch = checkpoint['epoch'] + 1
-            self.best_loss = checkpoint['best_loss']
+            self.start_epoch = checkpoint['epoch'] + 1; self.best_loss = checkpoint['best_loss']
             self.logger.info(f"Resumed from epoch {self.start_epoch} (best loss: {self.best_loss:.5f})")
-        except Exception as e:
-            self.logger.error(f"Error loading checkpoint: {e}. Starting fresh.")
+        except Exception as e: self.logger.error(f"Error loading checkpoint: {e}. Starting fresh.")
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
-        state = {
-            'epoch': epoch, 'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(), 'scaler_state_dict': self.scaler.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(), 'best_loss': self.best_loss,
-        }
+        state = {'epoch': epoch, 'model_state_dict': self.model.state_dict(), 'optimizer_state_dict': self.optimizer.state_dict(), 'scaler_state_dict': self.scaler.state_dict(), 'scheduler_state_dict': self.scheduler.state_dict(), 'best_loss': self.best_loss}
         torch.save(state, Path(self.config['checkpoint_dir']) / 'last_checkpoint.pth')
         if is_best:
             torch.save(self.model.state_dict(), Path(self.config['checkpoint_dir']) / 'best_model.pth')
@@ -193,8 +180,9 @@ class Trainer:
 
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
-        total_loss = 0.0
+        total_loss_epoch = 0.0
         accum_steps = self.config.get('grad_accum_steps', 1)
+        p_weight = self.config.get('perceptual_weight', 0.1)
         
         pbar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{self.config['num_epochs']}", dynamic_ncols=True, leave=False)
         
@@ -203,9 +191,14 @@ class Trainer:
             
             with autocast(device_type=self.device.type, enabled=self.use_amp):
                 outputs = self.model(inputs)
-                loss = self.criterion(outputs, targets) / accum_steps
-            
-            self.scaler.scale(loss).backward()
+                
+                loss_l1 = self.criterion_l1(outputs, targets)
+                loss_p = self.criterion_perceptual(outputs, targets)
+                total_loss_batch = loss_l1 + p_weight * loss_p
+                
+                loss_to_backward = total_loss_batch / accum_steps
+
+            self.scaler.scale(loss_to_backward).backward()
             
             if (i + 1) % accum_steps == 0 or (i + 1) == len(self.dataloader):
                 self.scaler.unscale_(self.optimizer)
@@ -214,46 +207,30 @@ class Trainer:
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
             
-            total_loss += loss.item() * accum_steps
-            pbar.set_postfix(loss=f"{loss.item() * accum_steps:.5f}")
+            total_loss_epoch += total_loss_batch.item()
+            pbar.set_postfix(loss=f"{total_loss_batch.item():.5f}", l1=f"{loss_l1.item():.5f}", p=f"{loss_p.item():.5f}")
             
             if i == 0:
                 self._save_preview(inputs, outputs, targets, epoch)
                 self._cleanup_previews(keep=10)
             
-            if i % 5 == 0:
-                self._check_gpu_temp()
+            if i % 5 == 0: self._check_gpu_temp()
         
-        return total_loss / len(self.dataloader)
+        return total_loss_epoch / len(self.dataloader)
 
     def train(self):
-        try:
-            self.logger.info(f"Starting training on {self.device}...")
-            start_time = time.time()
-            self.logger.info(f"Current Best Loss: {self.best_loss:.5f}")
-            
-            for epoch in range(self.start_epoch, self.config['num_epochs']):
-                self.train_summary['Epochs'] += 1
-                epoch_loss = self._train_epoch(epoch)
-                lr = self.optimizer.param_groups[0]['lr']
-                self.train_summary['Learning Rate'] = lr
-                self.scheduler.step(epoch_loss)
-                
-                is_best = epoch_loss < self.best_loss
-                if is_best: 
-                    self.best_loss = epoch_loss
-                    self.train_summary['Best Loss'] = self.best_loss
-                
-                self.train_summary['Last Loss'] = epoch_loss
-                self.train_summary['Time'] += time.time() - start_time
-                self._save_checkpoint(epoch, is_best)
-                
-                self.logger.info(f"Epoch {epoch+1:03d} | Loss: {epoch_loss:.5f} | LR: {lr:.2e}")
-                self._check_gpu_temp()
-            
-            self.logger.info(f"Training completed in {(time.time() - start_time)/60:.2f} minutes.")
-        except KeyboardInterrupt:
-            self.logger.info(f"Training Summary: Best Loss: {self.train_summary['Best Loss']:.5f}, Last Loss: {self.train_summary['Last Loss']:.5f}, Learning Rate: {self.train_summary['Learning Rate']:.2e}, Epochs: {self.train_summary['Epochs']}, Time: {self.train_summary['Time']:.2f} seconds")
+        self.logger.info(f"Starting training on {self.device}...")
+        start_time = time.time()
+        for epoch in range(self.start_epoch, self.config['num_epochs']):
+            epoch_loss = self._train_epoch(epoch)
+            lr = self.optimizer.param_groups[0]['lr']
+            self.scheduler.step(epoch_loss)
+            is_best = epoch_loss < self.best_loss
+            if is_best: self.best_loss = epoch_loss
+            self._save_checkpoint(epoch, is_best)
+            self.logger.info(f"Epoch {epoch+1:03d} | Loss: {epoch_loss:.5f} | LR: {lr:.2e}")
+            self._check_gpu_temp()
+        self.logger.info(f"Training completed in {(time.time() - start_time)/60:.2f} minutes.")
 
     def _save_preview(self, inputs, outputs, targets, epoch):
         preview_dir = Path(self.config['preview_dir'])
@@ -264,22 +241,18 @@ class Trainer:
 
     def _cleanup_previews(self, keep=10):
         preview_dir = Path(self.config['preview_dir'])
-        previews = sorted(
-            [p for p in preview_dir.glob("preview_*.png") if p.stem.replace("preview_", "").isdigit()],
-            key=lambda p: int(p.stem.replace("preview_", ""))
-        )
+        previews = sorted([p for p in preview_dir.glob("preview_*.png") if p.stem.replace("preview_", "").isdigit()], key=lambda p: int(p.stem.replace("preview_", "")))
         if len(previews) > keep:
             for f in previews[:-keep]:
                 try: f.unlink()
                 except OSError as e: self.logger.error(f"Error deleting preview: {f.name}: {e}")
-
+                
     def _check_gpu_temp(self, threshold=85, delay=15):
         if not getGPUs or self.device.type != 'cuda': return
         try:
             gpu = getGPUs()[0]
             temperature = gpu.temperature + 2.0
-            if temperature > threshold:
+            if temperature >= threshold:
                 self.logger.warning(f"GPU temp >{threshold}°C ({temperature}°C). Throttling for {delay}s.")
                 time.sleep(delay)
-        except Exception as e:
-            self.logger.error(f"GPU temp check failed: {e}")
+        except Exception as e: self.logger.error(f"GPU temp check failed: {e}")
