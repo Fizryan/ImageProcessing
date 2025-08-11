@@ -55,7 +55,7 @@ class ImageRestorer:
         padded_img.paste(resized_img, (paste_x, paste_y))
         return padded_img, paste_box
 
-    def _prepare_tensor(self, img_pil: Image.Image, task_type: Literal['noise', 'mosaic', 'inpainting']):
+    def _prepare_tensor(self, img_pil: Image.Image, task_type: Literal['noise', 'mosaic', 'inpainting', 'blur']):
         padded_pil, paste_box = self._resize_with_padding(img_pil, self.target_size)
         img_tensor = transforms.ToTensor()(padded_pil)
         mask_size = (self.target_size[1], self.target_size[0])
@@ -64,7 +64,7 @@ class ImageRestorer:
         model_input = model_input * 2.0 - 1.0
         return model_input.unsqueeze(0).to(self.device), paste_box
 
-    def restore_image(self, image_pil: Image.Image, task_type: Literal['noise', 'mosaic', 'inpainting'] = 'noise'):
+    def restore_image(self, image_pil: Image.Image, task_type: Literal['noise', 'mosaic', 'inpainting', 'blur'] = 'noise'):
         image_pil = ImageOps.exif_transpose(image_pil)
         original_size = image_pil.size
         with torch.no_grad():
@@ -76,7 +76,7 @@ class ImageRestorer:
         output_pil_cropped = output_pil_padded.crop(paste_box)
         return output_pil_cropped.resize(original_size, Image.Resampling.LANCZOS)
 
-    def restore_image_from_path(self, input_path: Path, output_path: Path, task_type: Literal['noise', 'mosaic', 'inpainting'] = 'noise'):
+    def restore_image_from_path(self, input_path: Path, output_path: Path, task_type: Literal['noise', 'mosaic', 'inpainting', 'blur'] = 'noise'):
         if not input_path.exists():
             self.logger.error(f"Input file not found: {input_path}")
             return False
@@ -91,8 +91,8 @@ class ImageRestorer:
             self.logger.error(f"Failed to process {input_path.name}: {e}", exc_info=True)
             return False
 
-    def process_directory(self, input_dir: str | Path, output_dir: str | Path, 
-            task_type: Literal['noise', 'mosaic', 'inpainting'] = 'noise'):
+    def process_directory(self, input_dir: str | Path, output_dir: str | Path,
+            task_type: Literal['noise', 'mosaic', 'inpainting', 'blur'] = 'noise'):
         input_dir = Path(input_dir)
         output_dir = Path(output_dir)
 

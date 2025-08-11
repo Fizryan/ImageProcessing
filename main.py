@@ -103,7 +103,7 @@ def handle_inference():
     restorer = ImageRestorer(model_path=model_path, img_height=img_height, img_width=img_width)
     input_path = get_user_input("Path to the input image", "dataset/clean_images")
     output_path = get_user_input("Path to save the restored image", "Results")
-    task_type = get_user_input("Task type (noise, mosaic, inpainting)", "noise", str)
+    task_type = get_user_input("Task type (noise, mosaic, inpainting, blur)", "noise", str)
     restored_image = restorer.process_directory(input_dir=input_path, output_dir=output_path, task_type=task_type)
     logger.info(f"Inference completed.")
 
