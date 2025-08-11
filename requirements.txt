@@ -2,3 +2,4 @@ Pillow
 tqdm
 GPUtil
 requests
+opencv-python
