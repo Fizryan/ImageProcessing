@@ -32,7 +32,7 @@ def resize_image_worker(input_path, output_path, size, resample_filter, output_f
 
 class Resizer:
     def __init__(self, input_dir="dataset/clean_images", output_dir="dataset/resized_images", 
-            width=384, height=512, output_format="PNG", max_workers=4, 
+            width=384, height=512, output_format="PNG", max_workers=None, 
             max_retries=3, overwrite=False):
         
         self.input_dir = Path(input_dir).resolve()

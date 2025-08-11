@@ -41,7 +41,7 @@ def grayscale_image_worker(input_path, output_dir, output_format, max_retries, o
 
 class Grayscaler:
     def __init__(self, input_dir="dataset/clean_images", output_dir="dataset/grayscale_images", 
-                 output_format: Optional[str] = None, max_workers=4, max_retries=3, overwrite=False):
+            output_format: Optional[str] = None, max_workers=None, max_retries=3, overwrite=False):
         
         self.input_dir = Path(input_dir).resolve()
         if not self.input_dir.is_dir():

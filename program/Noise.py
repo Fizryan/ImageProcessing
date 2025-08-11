@@ -48,7 +48,7 @@ def process_image_worker(image_path, output_dir, noise_type, noise_level, seed, 
 
 class NoiseGenerator:
     def __init__(self, input_dir="dataset/clean_images", noise_dir="dataset/noisy_images", 
-                 noise_level=0.1, noise_type='random', max_workers=4, max_retries=3, overwrite=False):
+                 noise_level=0.1, noise_type='random', max_workers=None, max_retries=3, overwrite=False):
         self.input_dir = Path(input_dir)
         self.noise_dir = Path(noise_dir)
         self.noise_level = noise_level
