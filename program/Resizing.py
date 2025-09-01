@@ -1,5 +1,5 @@
 # Resizer.py
-# This script resizes images from a specified input directory and saves them to an output directory.
+# This script resizes images from a specified input directory and saves them to an output directory,
 
 import logging
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 def resize_image_worker(input_path, output_path, size, resample_filter, output_format, max_retries, overwrite) -> Tuple[str, str]:
     if output_path.exists() and not overwrite:
@@ -32,14 +34,13 @@ def resize_image_worker(input_path, output_path, size, resample_filter, output_f
 
 class Resizer:
     def __init__(self, input_dir="dataset/clean_images", output_dir="dataset/resized_images", 
-            width=384, height=512, output_format="PNG", max_workers=None, 
+            width=448, height=256, output_format="PNG", max_workers=None, 
             max_retries=3, overwrite=False):
         
         self.input_dir = Path(input_dir).resolve()
         if not self.input_dir.exists():
             raise FileNotFoundError(f"Input directory {self.input_dir} does not exist.")
         self.output_dir = Path(output_dir).resolve()
-        self.size = (width, height)
         self.output_format = output_format
         self.resample_filter = Image.Resampling.LANCZOS
         self.max_workers = max_workers
@@ -50,6 +51,14 @@ class Resizer:
         if not (isinstance(width, int) and width > 0 and isinstance(height, int) and height > 0):
             self.logger.error("Width and height must be positive integers.")
             raise ValueError("Width and height must be positive integers.")
+        
+        output_width = max(width, height)
+        output_height = min(width, height)
+        self.size = (output_width, output_height)
+        if self.size != (width, height):
+            self.logger.warning(
+                f"Target size was portrait. Auto-swapped to landscape: {self.size}"
+            )
             
         self._prepare_directory()
     
@@ -60,7 +69,12 @@ class Resizer:
     @staticmethod
     def _process_and_resize(img: Image.Image, size: tuple, resample_filter) -> Image.Image:
         processed_img = ImageOps.exif_transpose(img)
+        
+        if processed_img.height > processed_img.width:
+            processed_img = processed_img.transpose(Image.Transpose.ROTATE_270)
+
         processed_img = processed_img.convert("RGB")
+        
         return processed_img.resize(size, resample_filter)
 
     def process_images(self):
