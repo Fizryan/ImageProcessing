@@ -6,11 +6,14 @@
 /logs
 /Results
 /Samples
+/Models
+/Testing
 
 # Python virtual environment
 venv/
 .env
 /venv
+.vscode
 
 # log files
 *.log
