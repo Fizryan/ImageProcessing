@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 class CollectingImage:
     def __init__(self, save_path="dataset/clean_images", count=10, width=3060, height=4080, 
-            max_workers=5, max_retries=3, source="pexels", pexels_query="nature", resize=True):
+            max_workers=5, max_retries=3, source="picsum", pexels_query="nature", resize=True):
         
         self.save_path = Path(save_path)
         self.count = count
