@@ -5,10 +5,14 @@ import logging
 import logging.config
 import time
 import queue
-from logging.handlers import QueueHandler, QueueListener
-from typing import Any, Callable
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
+from typing import Any, Callable, List
 from pathlib import Path
 from tqdm import tqdm
+
+import torch
+from PIL import Image
+from torchvision import transforms
 
 from program.Logging_Config import LOGGING_CONFIG
 from program.Training_Config import TRAINING_CONFIG
@@ -18,10 +22,12 @@ from program.Resizing import Resizer
 from program.Noise import NoiseGenerator
 from program.Grayscaling import Grayscaler
 from program.Mosaic import MosaicGenerator
-from program.BlurGenerator import BlurGenerator
-from program.Training import Trainer, LRFinder, CombinedRestorationDataset
-from program.Architecture import UNetLite
+from program.MaskGenerator import MaskGenerator
+from program.BlurGenerator import BlurGenerator, apply_blur
+from program.Training import Trainer
 from program.Inference import ImageRestorer
+from program.MaskDetector_Training import MaskDetectorTrainer
+from program.MaskDetector_Training_Config import DETECTOR_TRAINING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +69,17 @@ def handle_resize():
 
 def handle_noise():
     logger.info("Starting noise generation process...")
-    input_dir = get_user_input("Input directory", "dataset/re_augmented_images")
+    input_dir = get_user_input("Input directory", "dataset/resized_images")
     mask_dir = get_user_input("Mask directory", "dataset/mask_images")
     output_dir = get_user_input("Output directory", "dataset/noisy_images")
     noise_level = get_user_input("Noise level (0.0 to 1.0)", 0.1, float)
     overwrite = (
         get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == "yes"
     )
-    overwrite = True if overwrite else False
     noiser = NoiseGenerator(
         input_dir=input_dir,
-        noise_dir=output_dir,
         mask_dir=mask_dir,
+        noise_dir=output_dir,
         noise_level=noise_level,
         overwrite=overwrite,
     )
@@ -91,7 +96,6 @@ def handle_grayscale():
     overwrite = (
         get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == "yes"
     )
-    overwrite = True if overwrite else False
     grayscaler = Grayscaler(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -103,18 +107,17 @@ def handle_grayscale():
 
 def handle_mosaic():
     logger.info("Starting mosaic image generation process...")
-    input_dir = get_user_input("Input directory", "dataset/re_augmented_images")
+    input_dir = get_user_input("Input directory", "dataset/resized_images")
     mask_dir = get_user_input("Mask directory", "dataset/mask_images")
     output_dir = get_user_input("Output directory", "dataset/mosaic_images")
     block_size = get_user_input("Block size for mosaic effect", 25, int)
     overwrite = (
         get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == "yes"
     )
-    overwrite = True if overwrite else False
     mosaic_gen = MosaicGenerator(
         input_dir=input_dir,
-        output_dir=output_dir,
         mask_dir=mask_dir,
+        output_dir=output_dir,
         block_size=block_size,
         overwrite=overwrite,
     )
@@ -131,7 +134,6 @@ def handle_blur():
     overwrite = (
         get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == "yes"
     )
-    overwrite = True if overwrite else False
     blur_gen = BlurGenerator(
         input_dir=input_dir,
         output_dir=output_dir,
@@ -147,81 +149,79 @@ def handle_training():
     trainer.train()
 
 
-def handle_lr_finder():
-    logger.info("Starting Learning Rate Finder...")
-    if TRAINING_CONFIG.get("training_mode") != "restoration":
-        logger.error("LR Finder is only implemented for 'restoration' mode.")
-        return
+def handle_inpainting_training():
+    """Handles training for the inpainting task with a dedicated config."""
+    logger.info("Starting model training process for Inpainting...")
 
-    try:
-        import torch
-        import torch.optim as optim
-        from torch.utils.data import DataLoader
+    from copy import deepcopy
 
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        image_size = (
-            TRAINING_CONFIG["img_height"],
-            TRAINING_CONFIG["img_width"],
-        )
-        dataset = CombinedRestorationDataset(
-            clean_dir=Path(TRAINING_CONFIG["data_dirs"]["train"]["clean"]),
-            task_dirs=TRAINING_CONFIG["data_dirs"]["train"],
-            image_size=image_size,
-            cache_limit=10,
-        )
-        dataloader = DataLoader(dataset, **TRAINING_CONFIG["dataloader_params"])
-        model = UNetLite(
-            in_channels=4,
-            out_channels=3,
-            base_channels=TRAINING_CONFIG.get("base_channels", 16),
-        ).to(device)
-        optimizer = optim.AdamW(model.parameters(), lr=1e-7)
-        criterion = torch.nn.L1Loss()
+    inpainting_config = deepcopy(TRAINING_CONFIG)
 
-        lr_finder = LRFinder(model, optimizer, criterion, device, dataloader)
-        lr_finder.range_test(end_lr=1, num_iter=200)
-        lr_finder.plot(save_path="Training/lr_finder_plot.png")
-    except Exception as e:
-        logger.error(f"Failed to run LR Finder: {e}", exc_info=True)
+    inpainting_config["task_type"] = "inpainting"
+    inpainting_config["checkpoint_dir"] = "Training/inpainting_checkpoints"
+    inpainting_config["preview_dir"] = "Training/inpainting_previews"
+    inpainting_config["log_file"] = "Training/inpainting_checkpoints/Training.log"
+
+    trainer = Trainer(config=inpainting_config)
+    trainer.train()
 
 
-def handle_inference():
-    logger.info("Starting image restoration process...")
+def handle_generate_detector_data():
+    logger.info("Starting mosaic detector data generation...")
+    clean_dir = get_user_input(
+        "Input directory (resized clean images)", "dataset/resized_images"
+    )
+    output_dir = get_user_input(
+        "Output directory for detector data", "dataset/detector_data"
+    )
+    block_size = get_user_input("Mosaic block size", 16, int)
+    overwrite = (
+        get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == "yes"
+    )
+
+    generator = MaskGenerator(
+        clean_dir=clean_dir,
+        output_dir=output_dir,
+        block_size=block_size,
+        overwrite=overwrite,
+    )
+    generator.generate_data()
+
+
+def handle_train_detector():
+    logger.info("Starting mosaic detector model training...")
+    trainer = MaskDetectorTrainer(config=DETECTOR_TRAINING_CONFIG)
+    trainer.train()
+
+
+def handle_demosaic_inference():
+    logger.info("Starting image restoration (Demosaic/Inpainting) process...")
     model_path = get_user_input(
-        "Path to the trained model", "Training/checkpoints/best_model.pth"
+        "Path to the trained restoration model", "Training/checkpoints/best_model.pth"
     )
     if not Path(model_path).exists():
         logger.error(f"Model file not found: {model_path}")
         return
 
-    img_height = get_user_input(
-        "Image height model was trained on", TRAINING_CONFIG.get("img_height", 256), int
-    )
-    img_width = get_user_input(
-        "Image width model was trained on", TRAINING_CONFIG.get("img_width", 448), int
-    )
-    base_channels = get_user_input(
-        "Model base channels", TRAINING_CONFIG.get("base_channels", 12), int
-    )
-    restorer = ImageRestorer(
-        model_path=model_path,
-        img_height=img_height,
-        img_width=img_width,
-        base_channels=base_channels,
-    )
+    try:
+        restorer = ImageRestorer(model_path=model_path)
+    except Exception as e:
+        logger.error(f"Failed to initialize the restorer: {e}", exc_info=True)
+        return
 
     input_path_str = get_user_input(
-        "Path to input image or directory", "Samples/images"
+        "Path to input image or directory", "Samples/test_images"
     )
     input_path = Path(input_path_str)
     if not input_path.exists():
         logger.error(f"Input path does not exist: {input_path}")
         return
 
-    task_type = get_user_input(
-        "Task type (noise, mosaic, inpainting, blur)", "inpainting", str
-    )
-    iterations = get_user_input("Number of iterations (for bettler results)", 5, int)
+    iterations = get_user_input("Number of iterations (for better results)", 1, int)
+    if iterations > 1:
+        logger.info(
+            "Using iterative refinement. This may take longer but can improve quality."
+        )
 
     use_tta = (
         get_user_input(
@@ -229,104 +229,35 @@ def handle_inference():
         ).lower()
         == "yes"
     )
-
-    final_blend_alpha = 0.0
-    use_poisson = False
-    use_multi_scale = False
-    use_edge_aware = False
-    adaptive_iterations = False
-
-    if task_type == "inpainting":
-        strategy = get_user_input(
-            "Choose strategy [1: Iterative, 2: Multi-Scale, 3: Adaptive]", "1", str
-        )
-
-        if strategy == "2":
-            use_multi_scale = True
-            logger.info("Using Multi-Scale Inpainting strategy.")
-        elif strategy == "3":
-            adaptive_iterations = True
-            logger.info(
-                f"Using Adaptive Inpainting strategy with max {iterations} iterations."
-            )
-        else:
-            logger.info(
-                f"Using standard Iterative Inpainting with {iterations} iterations."
-            )
-            use_poisson = (
-                get_user_input(
-                    "Use Poisson Blending for seamless results? (yes/no)", "yes", str
-                ).lower()
-                == "yes"
-            )
-
-        use_edge_aware = (
-            get_user_input(
-                "Use Edge-Aware mask refinement? (yes/no)", "no", str
-            ).lower()
-            == "yes"
-        )
-    else:
-        final_blend_alpha = get_user_input(
-            "Final blend with original (0.0 to 1.0, 0=off)", 0.0, float
-        )
+    final_blend_alpha = get_user_input(
+        "Final blend with original (0.0 to 1.0, 0=off)", 0.0, float
+    )
 
     if input_path.is_file():
         output_path_str = get_user_input(
             "Path to save the restored image", f"Results/{input_path.stem}_restored.png"
         )
         output_path = Path(output_path_str)
-        mask_path = None
-        if task_type == "inpainting":
-            mask_path_str = get_user_input(
-                "Path to the mask image", f"Samples/masks/{input_path.name}"
-            )
-            mask_path = Path(mask_path_str)
-            if not mask_path.exists():
-                logger.error(f"Mask path does not exist: {mask_path}")
-                return
         restorer.restore_image_from_path(
             input_path,
             output_path,
-            task_type,
-            mask_path=mask_path,
             iterations=iterations,
             use_tta=use_tta,
             final_blend_alpha=final_blend_alpha,
-            use_poisson_blending=use_poisson,
-            use_multi_scale=use_multi_scale,
-            use_edge_aware=use_edge_aware,
-            adaptive_iterations=adaptive_iterations,
         )
 
     elif input_path.is_dir():
-        output_dir_str = get_user_input("Path to save the restored images", "Results")
+        output_dir_str = get_user_input(
+            "Path to save the restored images", "Results/test_images"
+        )
         output_dir = Path(output_dir_str)
-        mask_dir = None
-        if task_type == "inpainting":
-            mask_dir_str = get_user_input(
-                "Path to the directory of masks (must have same filenames)",
-                "Samples/masks",
-            )
-            mask_dir = Path(mask_dir_str)
-            if not mask_dir.exists() or not mask_dir.is_dir():
-                logger.error(
-                    f"Mask directory does not exist or is not a directory: {mask_dir}"
-                )
-                return
 
         restorer.process_directory(
             input_dir=input_path,
             output_dir=output_dir,
-            task_type=task_type,
-            mask_dir=mask_dir,
             iterations=iterations,
             use_tta=use_tta,
             final_blend_alpha=final_blend_alpha,
-            use_poisson_blending=use_poisson,
-            use_multi_scale=use_multi_scale,
-            use_edge_aware=use_edge_aware,
-            adaptive_iterations=adaptive_iterations,
         )
     else:
         logger.error(f"Input path is not a valid file or directory: {input_path}")
@@ -335,99 +266,171 @@ def handle_inference():
     logger.info("Inference completed.")
 
 
-def handle_dataset():
-    logger.info("Starting dataset preparation process...")
-    input_dir = get_user_input("Input directory for dataset", "dataset")
-    output_dir = get_user_input("Output directory for dataset", "dataset")
+def handle_detector_inference():
+    logger.info("Starting mosaic mask detection process...")
+    model_path = get_user_input(
+        "Path to the trained detector model",
+        "Training/detector_checkpoints/best_detector_model.pth",
+    )
+    if not Path(model_path).exists():
+        logger.error(f"Model file not found: {model_path}")
+        return
 
-    input_user = (
-        get_user_input("download new images? (yes/no)", "no", str).lower() == "yes"
-    )
-    if input_user:
-        logger.info("Starting image download process...")
-        count = get_user_input("Number of images to download", 20, int)
-        collector = CollectingImage(
-            count=count, max_workers=5, save_path=output_dir + "/clean_images"
-        )
-        collector.download_images()
+    try:
+        detector = ImageRestorer(model_path=model_path, is_detector=True)
+        logger.info("Detector model loaded into inference engine.")
+    except Exception as e:
+        logger.error(f"Failed to initialize the detector: {e}", exc_info=True)
+        return
 
-    overwrite = (
-        get_user_input("Overwrite existing files? (yes/no)", "no", str).lower() == "yes"
+    input_path_str = get_user_input(
+        "Path to input image or directory", "Samples/test_images"
     )
-    overwrite = True if overwrite else False
+    input_path = Path(input_path_str)
+    if not input_path.exists():
+        logger.error(f"Input path does not exist: {input_path}")
+        return
 
-    logger.info("Starting image resizing process...")
-    height = get_user_input("Target height", 256, int)
-    width = get_user_input("Target width", 448, int)
-    resizer = Resizer(
-        input_dir=input_dir + "/clean_images",
-        output_dir=output_dir + "/resized_images",
-        width=width,
-        height=height,
-        overwrite=overwrite,
+    output_dir_str = get_user_input(
+        "Path to save the detected masks", "Results/test_masks"
     )
-    resizer.process_images()
+    output_dir = Path(output_dir_str)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("Starting noise generation process...")
-    noise_level = get_user_input("Noise level (0.0 to 1.0)", 0.1, float)
-    noiser = NoiseGenerator(
-        input_dir=input_dir + "/resized_images",
-        noise_dir=output_dir + "/noisy_images",
-        noise_level=noise_level,
-        overwrite=overwrite,
+    image_files: List[Path] = (
+        [input_path] if input_path.is_file() else list(input_path.glob("*.*"))
     )
-    noiser.generate_noisy_images()
 
-    logger.info("Starting mosaic image generation process...")
-    block_size = get_user_input("Block size for mosaic effect (1 to 100)", 5, int)
-    mosaic_gen = MosaicGenerator(
-        input_dir=input_dir + "/resized_images",
-        output_dir=output_dir + "/mosaic_images",
-        block_size=block_size,
-        overwrite=overwrite,
-    )
-    mosaic_gen.generate_mosaic_images()
+    for img_path in tqdm(image_files, desc="Detecting masks"):
+        try:
+            with Image.open(img_path) as img:
+                mask_pil = detector.detect_mask(img)
+                mask_pil.save(output_dir / f"{img_path.stem}_mask.png")
+        except Exception as e:
+            logger.error(f"Failed to process {img_path.name}: {e}")
 
-    logger.info("Starting grayscale conversion process...")
-    output_format = get_user_input(
-        "Output format (e.g., PNG, JPEG, or leave empty to keep original)", "PNG"
-    )
-    grayscaler = Grayscaler(
-        input_dir=input_dir + "/resized_images",
-        output_dir=output_dir + "/grayscale_images",
-        output_format=output_format or None,
-        overwrite=overwrite,
-    )
-    grayscaler.process_images()
+    logger.info("Mask detection completed.")
 
-    logger.info("Starting blur generation process...")
-    blur_radius_range = get_user_input(
-        "Blur radius range (min, max)", (1.0, 3.0), tuple
+
+def handle_full_pipeline():
+    logger.info("Starting full pipeline: Detect Mask -> Demosaic")
+
+    detector_model_path = get_user_input(
+        "Path to the trained detector model",
+        "Training/detector_checkpoints/best_detector_model.pth",
     )
-    blur_gen = BlurGenerator(
-        input_dir=input_dir + "/resized_images",
-        output_dir=output_dir + "/blurry_images",
-        blur_radius_range=blur_radius_range,
-        overwrite=overwrite,
+    if not Path(detector_model_path).exists():
+        logger.error(f"Detector model file not found: {detector_model_path}")
+        return
+    try:
+        detector = ImageRestorer(model_path=detector_model_path, is_detector=True)
+    except Exception as e:
+        logger.error(f"Failed to initialize the detector: {e}", exc_info=True)
+        return
+
+    demosaic_model_path = get_user_input(
+        "Path to the trained demosaic model", "Training/checkpoints/best_model.pth"
     )
-    blur_gen.generate_blurry_images()
+    if not Path(demosaic_model_path).exists():
+        logger.error(f"Demosaic model file not found: {demosaic_model_path}")
+        return
+    try:
+        restorer = ImageRestorer(model_path=demosaic_model_path)
+    except Exception as e:
+        logger.error(f"Failed to initialize the restorer: {e}", exc_info=True)
+        return
+
+    input_path_str = get_user_input(
+        "Path to input image or directory", "dataset/inference"
+    )
+    input_path = Path(input_path_str)
+    if not input_path.exists():
+        logger.error(f"Input path does not exist: {input_path}")
+        return
+
+    output_dir_str = get_user_input(
+        "Path to save the final restored images", "Results/full_pipeline"
+    )
+    output_dir = Path(output_dir_str)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    iterations = get_user_input("Demosaic iterations", 1, int)
+    use_tta = (
+        get_user_input("Use TTA for demosaic? (yes/no)", "no", str).lower() == "yes"
+    )
+
+    image_files: List[Path] = (
+        [input_path] if input_path.is_file() else list(input_path.glob("*.*"))
+    )
+
+    for img_path in tqdm(image_files, desc="Running Full Pipeline"):
+        try:
+            with Image.open(img_path) as original_img:
+                original_img = original_img.convert("RGB")
+
+                logger.debug(f"Detecting mask for {img_path.name}...")
+                detected_mask_pil = detector.detect_mask(original_img)
+
+                logger.debug(f"Restoring image {img_path.name}...")
+                restored_image = restorer.restore_image(
+                    original_img,
+                    iterations=iterations,
+                    use_tta=use_tta,
+                    mask_pil=detected_mask_pil,
+                )
+
+                output_path = output_dir / f"{img_path.stem}_restored.png"
+                restored_image.save(output_path)
+
+        except Exception as e:
+            logger.error(f"Failed to process {img_path.name} in pipeline: {e}")
+
+    logger.info("Full pipeline completed.")
+
+
+def handle_inference():
+    logger.info("Starting image restoration process...")
+
+    inference_type = get_user_input(
+        "Choose inference type [1: Demosaic, 2: Detect Mosaic Mask, 3: Full Pipeline]",
+        "1",
+        str,
+    )
+
+    if inference_type == "1":
+        handle_demosaic_inference()
+    elif inference_type == "2":
+        handle_detector_inference()
+    elif inference_type == "3":
+        handle_full_pipeline()
+    else:
+        logger.warning("Invalid choice. Please select 1, 2, or 3.")
+        return
 
 
 def display_menu():
     print("\n" + "=" * 28)
-    print("      IMAGE PROCESSING")
+    print("      IMAGE PROCESSING      ")
     print("=" * 28)
-    print("  1. Download New Images")
-    print("  2. Resize Images")
-    print("  3. Add Noise to Images")
-    print("  4. Convert Images to Grayscale")
-    print("  5. Generate Mosaic Images")
-    print("  6. Generate Blurry Images")
-    print("  7. Train Model")
-    print("  8. Run Inference (Image Restoration)")
-    print("  9. Prepare Dataset")
-    print(" 10. Find Optimal Learning Rate")
-    print("  0. Exit")
+    print("--- Data Preparation ---")
+    print(" 1. Download New Images")
+    print(" 2. Resize Images")
+    print(" 3. Generate Mosaic Detector Data")
+    print(" 4. Generate Mosaic Images")
+    print(" 5. Generate Blurry Images")
+    print(" 6. Add Noise to Images")
+    print(" 7. Convert to Grayscale")
+    print("")
+    print("--- Training ---")
+    print(" 8. Train Demosaic Model")
+    print(" 9. Train Inpainting Model")
+    print("10. Train Mosaic Detector Model")
+    print("")
+    print("--- Inference ---")
+    print("11. Run Inference (Menu)")
+    print("12. Run Full Pipeline (Detect & Demosaic)")
+    print("")
+    print(" 0. Exit")
     print("=" * 28)
 
 
@@ -440,9 +443,7 @@ def main():
 
     original_handlers = []
     for handler in root_logger.handlers[:]:
-        if isinstance(
-            handler, (logging.FileHandler, logging.handlers.RotatingFileHandler)
-        ):
+        if isinstance(handler, (logging.FileHandler, RotatingFileHandler)):
             original_handlers.append(handler)
             root_logger.removeHandler(handler)
 
@@ -455,18 +456,21 @@ def main():
     logger.info("Image Processing Pipeline started with process-safe logging.")
 
     actions = {
-        "1": handle_download,
-        "2": handle_resize,
-        "3": handle_noise,
-        "4": handle_grayscale,
-        "5": handle_mosaic,
-        "6": handle_blur,
-        "7": handle_training,
-        "8": handle_inference,
-        "9": handle_dataset,
-        "10": handle_lr_finder,
+        "1": ("Download New Images", handle_download),
+        "2": ("Resize Images", handle_resize),
+        "3": ("Generate Mosaic Detector Data", handle_generate_detector_data),
+        "4": ("Generate Mosaic Images", handle_mosaic),
+        "5": ("Generate Blurry Images", handle_blur),
+        "6": ("Add Noise to Images", handle_noise),
+        "7": ("Convert to Grayscale", handle_grayscale),
+        "8": ("Train Demosaic Model", handle_training),
+        "9": ("Train Inpainting Model", handle_inpainting_training),
+        "10": ("Train Mosaic Detector Model", handle_train_detector),
+        "11": ("Run Inference (Menu)", handle_inference),
+        "12": ("Run Full Pipeline (Detect & Demosaic)", handle_full_pipeline),
     }
 
+    start_time = time.time()
     try:
         while True:
             display_menu()
@@ -476,11 +480,13 @@ def main():
                 logger.info("Exiting program. Goodbye!")
                 break
 
-            action = actions.get(choice)
-            if action:
+            action_tuple = actions.get(choice)
+            if action_tuple:
+                action_name, action_func = action_tuple
                 try:
-                    action()
-                    logger.info(f"Task '{action.__name__}' completed successfully.")
+                    logger.info(f"--- Executing: {action_name} ---")
+                    action_func()
+                    logger.info(f"Task '{action_name}' completed successfully.")
                 except Exception as e:
                     logger.error(
                         f"An unexpected error occurred during the task: {e}",
@@ -491,21 +497,18 @@ def main():
 
             time.sleep(1)
     finally:
+        logger.info(
+            f"Program completed in {(time.time() - start_time)/60:.2f} minutes."
+        )
         listener.stop()
 
 
 if __name__ == "__main__":
     try:
-        start_time = time.time()
         main()
-        logger.info(
-            f"Program completed in {(time.time() - start_time)/60:.2f} minutes."
-        )
     except KeyboardInterrupt:
         print("\n")
-        logger.info(
-            f"Program interrupted by user. Exiting... {(time.time() - start_time)/60:.2f} minutes."
-        )
+        logger.info(f"Program interrupted by user. Exiting...")
     except Exception as e:
         print("\n")
         logger.error(f"An unexpected error occurred: {e}", exc_info=True)

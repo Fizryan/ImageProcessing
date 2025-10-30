@@ -1,109 +1,67 @@
 # Training_Config.py
 # This module contains the configuration settings for the training pipeline of the image restoration model.
 
-TRAINING_MODE = "restoration"  # 'restoration' or 'super_resolution'
-MODEL_SIZE = "lite"
-
-COMMON_CONFIG = {
+TRAINING_CONFIG = {
+    # --- General ---
+    "task_type": "demosaic",  # 'demosaic', 'inpainting', or 'deblur'
+    "model_size": "efficient",
     "checkpoint_dir": "Training/checkpoints",
     "preview_dir": "Training/previews",
-    "num_epochs": 200,
-    "scheduler": "onecycle",  # 'onecycle' or 'plateau'
-    "compile_mode": "reduce-overhead",  # max-autotune
-    "learning_rate": 1e-3,  # For plateau, this is initial LR. For onecycle, this is max_lr.
-    "discriminator_lr": 1e-4,
-    "perceptual_weight": 0.8,  # range 0.0 - 1.0
-    "ssim_weight": 0.2,  # range 0.0 - 1.0
-    "multiscale_loss_weight": 0.5,  # range 0.0 - 1.0
-    "frequency_loss_weight": 0.1,  # range 0.0 - 1.0
-    "gan_weight": 0.1,  # range 0.0 - 1.0
-    "edge_weight": 0.15,  # range 0.0 - 1.0
-    "weight_decay": 1e-2,
-    "use_amp": True,
-    "use_channels_last": True,
-    "use_gan": True,
-    "use_checkpointing": True,
-    "use_ema": True,
-    "ema_decay": 0.999,
+    "log_file": "Training/checkpoints/Training.log",
+    "num_epochs": 250,
+    "checkpoint_interval_epochs": 5,
+    "sample_interval_epochs": 1,
+    # --- Model & Architecture ---
+    "base_channels": 32,
+    "mosaic_block_size_range": [5, 15],
+    "mosaic_opacity_range": [1.0, 1.0],
+    # --- Data ---
+    "train_clean_dir": "dataset/train/clean_images",  # Source for training
+    "val_clean_dir": "dataset/validation/clean_images",  # Source for validation
+    "train_mask_dir": "dataset/train/mask_images",  # Source for training masks
+    "val_mask_dir": "dataset/validation/mask_images",  # Source for validation masks
+    "img_height": 256,
+    "img_width": 448,
     "dataloader_params": {
+        "batch_size": 4,
         "shuffle": True,
         "num_workers": 4,
         "pin_memory": True,
         "persistent_workers": True,
     },
-    "sample_images": "Samples/images",
-    "sample_masks": "Samples/masks",
-    "use_progressive_training": False,
+    "val_batch_size": 4,
+    # --- Optimizer & Scheduler ---
+    "learning_rate": 0.0004930967808936792,
+    "weight_decay": 0.0008499301888996408,
+    "scheduler": "cosine_restarts",  # 'onecycle' or 'cosine_restarts'
+    "onecycle_params": {
+        "pct_start": 0.3771202692439005,
+        "div_factor": 20,
+        "final_div_factor": 1e4,
+    },
+    "cosine_restarts_params": {
+        "T_0": 10,
+        "eta_min": 1e-6,
+    },
+    # --- Performance ---
+    "use_amp": True,
+    "use_channels_last": True,
+    "compile_mode": "reduce-overhead",
+    "use_checkpointing": True,
+    "grad_clip": 1.3632420407003598,  # From Optuna
+    "early_stopping_patience": -1,
+    # --- Advanced Features ---
+    "use_advanced_loss": False,
+    "use_ema": True,
+    "ema_decay": 0.999,
+    "use_sharpness_loss": False,  # Set to True to enable the most advanced loss
+    "use_gan": True,  # Set to True to enable GAN training
+    "gan_weight": 0.016057043250212413,
+    "discriminator_lr": 0.0009464549369640666,
+    # Loss weights from Optuna
+    "l1_weight": 1.1128178555956723,
+    "lpips_weight": 0.8397145131281629,
+    "fft_weight": 0.05522052764990448,  # Bobot untuk FFT loss
+    # Other advanced features
+    "use_enhanced_architecture": True,  # Set to True to use DetailPreservationUNet
 }
-
-TRAINING_CONFIG = {}
-
-if TRAINING_MODE == "restoration":
-    RESTORATION_CONFIG = {
-        "training_mode": "restoration",
-        "model_size": MODEL_SIZE,
-        "data_dirs": {
-            "train": {
-                "clean": "dataset/train/clean_images",
-                # 'noise': 'dataset/train/noisy_images',
-                # 'mosaic': 'dataset/train/mosaic_images',
-                "inpainting": "dataset/train/inpainting_images",
-                "mask": "dataset/train/mask_images",
-                # 'blur': 'dataset/train/blurry_images'
-            },
-            "validation": {
-                "clean": "dataset/validation/clean_images",
-                # 'noise': 'dataset/validation/noisy_images',
-                # 'mosaic': 'dataset/validation/mosaic_images',
-                "inpainting": "dataset/validation/inpainting_images",
-                "mask": "dataset/validation/mask_images",
-                # 'blur': 'dataset/validation/blurry_images'
-            },
-        },
-        "img_height": 256,
-        "img_width": 448,
-        "dataloader_params": {"batch_size": 1},
-        "base_channels": 10,  # Further reduced to save memory
-        "grad_accum_steps": 4,  # Increase accumulation to maintain effective batch size
-        "checkpoint_interval_steps": 5000,
-        "onecycle_params": {
-            "pct_start": 0.3,
-            "div_factor": 25,
-            "final_div_factor": 1e4,
-            "three_phase": False,
-            "anneal_strategy": "cos",
-        },
-        "progressive_phases": [
-            {
-                "epochs": 50,
-                "size": (128, 224),
-                "lr_mult": 1.0,
-            },
-            {
-                "epochs": 150,
-                "size": (256, 448),
-                "lr_mult": 0.5,
-            },
-        ],
-    }
-    TRAINING_CONFIG = {**COMMON_CONFIG, **RESTORATION_CONFIG}
-    TRAINING_CONFIG["dataloader_params"] = {
-        **COMMON_CONFIG["dataloader_params"],
-        **RESTORATION_CONFIG["dataloader_params"],
-    }
-
-elif TRAINING_MODE == "super_resolution":
-    SR_CONFIG = {
-        "training_mode": "super_resolution",
-        "hr_data_dir": "dataset/resized_images",
-        "lr_patch_height": 128,
-        "lr_patch_width": 128,
-        "upscale_factor": 4,
-        "num_res_blocks": 16,
-        "dataloader_params": {"batch_size": 2},
-    }
-    TRAINING_CONFIG = {**COMMON_CONFIG, **SR_CONFIG}
-    TRAINING_CONFIG["dataloader_params"] = {
-        **COMMON_CONFIG["dataloader_params"],
-        **SR_CONFIG["dataloader_params"],
-    }

@@ -3,3 +3,5 @@ tqdm
 GPUtil
 requests
 opencv-python
+torchmetrics
+scikit-learn
