@@ -3,12 +3,12 @@
 
 TRAINING_CONFIG = {
     # --- General ---
-    "task_type": "demosaic",  # 'demosaic', 'inpainting', or 'deblur'
+    "task_type": "inpainting",  # 'demosaic', 'inpainting', or 'deblur'
     "model_size": "efficient",
     "checkpoint_dir": "Training/checkpoints",
     "preview_dir": "Training/previews",
     "log_file": "Training/checkpoints/Training.log",
-    "num_epochs": 250,
+    "num_epochs": 200,
     "checkpoint_interval_epochs": 5,
     "sample_interval_epochs": 1,
     # --- Model & Architecture ---
@@ -31,11 +31,11 @@ TRAINING_CONFIG = {
     },
     "val_batch_size": 4,
     # --- Optimizer & Scheduler ---
-    "learning_rate": 0.0004930967808936792,
-    "weight_decay": 0.0008499301888996408,
-    "scheduler": "cosine_restarts",  # 'onecycle' or 'cosine_restarts'
+    "learning_rate": 1.19e-07,
+    "weight_decay": 3.32e-07,
+    "scheduler": "onecycle",  # 'onecycle' or 'cosine_restarts'
     "onecycle_params": {
-        "pct_start": 0.3771202692439005,
+        "pct_start": 0.30610497251099344,
         "div_factor": 20,
         "final_div_factor": 1e4,
     },
@@ -48,20 +48,21 @@ TRAINING_CONFIG = {
     "use_channels_last": True,
     "compile_mode": "reduce-overhead",
     "use_checkpointing": True,
-    "grad_clip": 1.3632420407003598,  # From Optuna
+    "grad_clip": 1.680313,
+    "accumulation_steps": 4,
+    "ohem_percent": 1.0,  # Starting OHEM percentage
+    "ohem_schedule": [(0, 1.0), (25, 0.75), (75, 0.5)],  # (epoch, percent)
     "early_stopping_patience": -1,
-    # --- Advanced Features ---
     "use_advanced_loss": False,
     "use_ema": True,
-    "ema_decay": 0.999,
-    "use_sharpness_loss": False,  # Set to True to enable the most advanced loss
+    "use_sharpness_loss": False,
     "use_gan": True,  # Set to True to enable GAN training
-    "gan_weight": 0.016057043250212413,
-    "discriminator_lr": 0.0009464549369640666,
+    "gan_weight": 0.069420,
+    "discriminator_lr": 2.23e-04,
     # Loss weights from Optuna
-    "l1_weight": 1.1128178555956723,
-    "lpips_weight": 0.8397145131281629,
-    "fft_weight": 0.05522052764990448,  # Bobot untuk FFT loss
+    "l1_weight": 1.906870,
+    "lpips_weight": 0.637318,
+    "fft_weight": 0.122248,  # Weight for FFT loss
     # Other advanced features
     "use_enhanced_architecture": True,  # Set to True to use DetailPreservationUNet
 }

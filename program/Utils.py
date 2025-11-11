@@ -54,5 +54,5 @@ def load_model_weights(model: torch.nn.Module, state_dict: dict):
         logger.debug("Removing 'module.' prefix from checkpoint keys.")
         state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
 
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
     logger.info("Model weights loaded successfully.")

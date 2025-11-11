@@ -1,5 +1,5 @@
 # Training.py
-# Skrip training yang efisien untuk model inpainting dengan fokus pada optimasi VRAM dan performa
+# Efficient training script for inpainting models with a focus on VRAM and performance optimization
 
 import logging
 import time
@@ -102,10 +102,9 @@ class AdvancedRestorationLoss(nn.Module):
             "grad": self.gradient_loss(pred, target),
         }
 
-        # Dynamic weighting strategy
-        if current_epoch < 25:  # Focus on structure
+        if current_epoch < 25:
             weights = {"l1": 0.6, "perc": 0.2, "fft": 0.1, "grad": 0.1}
-        else:  # Focus on perceptual quality and details
+        else:
             weights = {"l1": 0.2, "perc": 0.4, "fft": 0.2, "grad": 0.2}
 
         total_loss = sum(weights.get(k, 0) * v for k, v in losses.items())
@@ -122,7 +121,6 @@ class SharpnessOptimizedLoss(nn.Module):
         self.l1_loss = nn.L1Loss()
         self.perceptual_loss = LightPerceptualLoss(device)
 
-        # Laplacian filter for edge detection
         laplacian_kernel = torch.tensor(
             [[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32
         ).view(1, 1, 3, 3)
@@ -212,8 +210,7 @@ class RestorationDataset(Dataset):
         image_size: Tuple[int, int],
         transform=None,
         mosaic_block_size_range: Tuple[int, int] = (16, 16),
-        # --- TAMBAHAN BARU ---
-        mosaic_opacity_range: Tuple[float, float] = (1.0, 1.0),  # (min, max) opacity
+        mosaic_opacity_range: Tuple[float, float] = (1.0, 1.0),
         use_masks=True,
         task_type="demosaic",
     ):
@@ -228,7 +225,6 @@ class RestorationDataset(Dataset):
         self.image_size = image_size
         self.transform = transform
         self.mosaic_block_size_range = mosaic_block_size_range
-        # --- TAMBAHAN BARU ---
         self.mosaic_opacity_range = mosaic_opacity_range
         self.use_masks = use_masks
         self.task_type = task_type
@@ -247,7 +243,6 @@ class RestorationDataset(Dataset):
                 clean_tensor = self.transform(clean_img)
             else:
                 clean_tensor = transforms.ToTensor()(clean_img)
-                # Ensure correct size if no crop transform is applied
                 if clean_tensor.shape[1:] != self.image_size:
                     clean_tensor = transforms.functional.resize(
                         clean_tensor, self.image_size
@@ -255,32 +250,25 @@ class RestorationDataset(Dataset):
 
             degraded_base_tensor = torch.zeros_like(clean_tensor)
             if self.task_type == "demosaic":
-                # 1. Pilih ukuran blok secara acak
                 block_size = random.randint(*self.mosaic_block_size_range)
                 pixelated_tensor = create_pixelated_mosaic(
                     clean_tensor, block_size=block_size
                 )
 
-                # --- BAGIAN BARU: Terapkan Opasitas Acak ---
-                # 2. Pilih tingkat opasitas (alpha) secara acak
                 opacity = random.uniform(*self.mosaic_opacity_range)
 
-                # 3. Campurkan (blend) gambar mosaik dengan gambar asli
                 degraded_base_tensor = (opacity * pixelated_tensor) + (
                     (1 - opacity) * clean_tensor
                 )
             elif self.task_type == "inpainting":
-                # Untuk inpainting, area yang rusak adalah hitam (nilai 0)
-                degraded_base_tensor = torch.zeros_like(clean_tensor)
+                degraded_base_tensor = torch.ones_like(clean_tensor)
 
-            # Apply mask if available
             if not self.use_masks:
                 input_tensor = degraded_base_tensor
                 return input_tensor, clean_tensor
 
             try:
                 mask_img = Image.open(mask_path).convert("L")
-                # Apply the same geometric transforms to mask
                 mask_tensor = transforms.ToTensor()(mask_img)
                 if mask_tensor.shape[1:] != self.image_size:
                     mask_tensor = transforms.functional.resize(
@@ -289,12 +277,10 @@ class RestorationDataset(Dataset):
                         interpolation=transforms.InterpolationMode.NEAREST,
                     )
 
-                # Combine degraded and clean based on mask
                 input_tensor = torch.where(
                     mask_tensor > 0.5, degraded_base_tensor, clean_tensor
                 )
             except FileNotFoundError:
-                # If mask not found, use fully degraded image
                 logging.debug(
                     f"Mask not found for {clean_path.name}, using full mosaic."
                 )
@@ -304,7 +290,6 @@ class RestorationDataset(Dataset):
 
         except Exception as e:
             logging.warning(f"Error processing {clean_path.name}: {e}, skipping.")
-            # Return a random other sample to avoid stopping training
             new_idx = (idx + 1) % len(self)
             return self.__getitem__(new_idx)
 
@@ -400,7 +385,7 @@ class Trainer:
         self.preview_dir.mkdir(parents=True, exist_ok=True)
 
     def initialize_model_only(self):
-        """Hanya membuat arsitektur model."""
+        """Initializes only the model architecture."""
         model_class = get_model(self.config)
         self.logger.info(f"Using generator architecture: {model_class.__name__}")
         self.generator = model_class(**self.config.get("model_params", {})).to(
@@ -418,7 +403,7 @@ class Trainer:
                 )
 
     def initialize_optimizers_and_schedulers(self):
-        """Membuat optimizer & scheduler SETELAH model dimuat."""
+        """Initializes optimizers and schedulers AFTER the model is loaded."""
         self.optimizer_G = optim.AdamW(
             self.generator.parameters(),
             lr=self.config["learning_rate"],
@@ -454,7 +439,7 @@ class Trainer:
             )
 
     def initialize_remaining_components(self):
-        """Inisialisasi sisa komponen seperti loss, scaler, metrics, dll."""
+        """Initializes the remaining components like loss, scaler, metrics, etc."""
         self.l1_loss = nn.L1Loss()
         self.perceptual_loss = LightPerceptualLoss(self.device)
 
@@ -586,14 +571,33 @@ class Trainer:
                     load_model_weights(
                         self.discriminator, checkpoint["discriminator_state_dict"]
                     )
+
+                # Also load optimizer and scaler to ensure a smooth continuation
+                if "optimizer_G_state_dict" in checkpoint:
+                    self.optimizer_G.load_state_dict(
+                        checkpoint["optimizer_G_state_dict"]
+                    )
+                    self.logger.info("Loaded optimizer state for fine-tuning.")
+                if "scaler_G_state_dict" in checkpoint:
+                    self.scaler_G.load_state_dict(checkpoint["scaler_G_state_dict"])
+                    self.logger.info("Loaded scaler state for fine-tuning.")
+
+                if self.config.get("use_ema") and "ema_state_dict" in checkpoint:
+                    self.ema.shadow = checkpoint["ema_state_dict"]
+                    self.logger.info("Loaded EMA state for fine-tuning.")
+
                 self.logger.info("Successfully loaded model weights for fine-tuning.")
 
+                # Initialize epoch and step, but carry over best metrics
                 self.start_epoch = 0
                 self.global_step = 0
-                self.best_psnr = 0.0
-                self.best_lpips = float("inf")
+                self.best_psnr = checkpoint.get("best_psnr", 0.0)
+                self.best_lpips = checkpoint.get("best_lpips", float("inf"))
+                self.logger.info(
+                    f"Carrying over best metrics from checkpoint: LPIPS={self.best_lpips:.4f}, PSNR={self.best_psnr:.2f}"
+                )
                 return
-            except Exception:
+            except Exception as e:
                 self.logger.error(
                     f"Failed to load fine-tuning checkpoint: {e}. Starting from scratch.",
                     exc_info=True,
@@ -721,16 +725,32 @@ class Trainer:
         return total_loss, loss_dict
 
     def train_epoch(self, epoch):
-        """Loop training yang disederhanakan dengan logika GAN yang benar."""
+        """Training loop with OHEM (Online Hard Example Mining) and gradient accumulation."""
         self.generator.train()
         if self.config.get("use_gan"):
             self.discriminator.train()
+
+        # --- Get hyperparameters from config ---
+        accumulation_steps = self.config.get("accumulation_steps", 1)
+        # Get OHEM percentage for the current epoch
+        ohem_percent = self._get_current_ohem_percent(epoch)
+        if epoch == 0 or self._get_current_ohem_percent(epoch - 1) != ohem_percent:
+            self.logger.info(
+                f"🔥 OHEM percentage for this epoch set to: {ohem_percent*100}%"
+            )
 
         progress_bar = tqdm(
             self.train_loader,
             desc=f"Epoch {epoch+1}/{self.config['num_epochs']}",
             leave=False,
         )
+
+        self.optimizer_G.zero_grad()
+        if self.config.get("use_gan"):
+            self.optimizer_D.zero_grad()
+
+        total_loss_G_epoch = 0.0
+        total_loss_D_epoch = 0.0
 
         for batch_idx, (degraded, clean) in enumerate(progress_bar):
             degraded = degraded.to(self.device, non_blocking=True)
@@ -741,16 +761,16 @@ class Trainer:
             ):
                 restored = self.generator(degraded)
 
-            loss_D = torch.tensor(0.0)
+            loss_D = torch.tensor(0.0, device=self.device)
             if self.config.get("use_gan"):
-                self.optimizer_D.zero_grad()
-
                 with autocast(
                     device_type=self.device.type,
                     enabled=self.config.get("use_amp", True),
                 ):
                     pred_real = self.discriminator(clean)
                     loss_D_real = self.gan_loss(pred_real, torch.ones_like(pred_real))
+                    loss_D_real = loss_D_real / accumulation_steps
+
                 self.scaler_D.scale(loss_D_real).backward()
 
                 with autocast(
@@ -759,46 +779,103 @@ class Trainer:
                 ):
                     pred_fake = self.discriminator(restored.detach())
                     loss_D_fake = self.gan_loss(pred_fake, torch.zeros_like(pred_fake))
+                    loss_D_fake = loss_D_fake / accumulation_steps
+
                 self.scaler_D.scale(loss_D_fake).backward()
 
-                self.scaler_D.step(self.optimizer_D)
-                self.scaler_D.update()
+                loss_D = (loss_D_real + loss_D_fake) * 0.5 * accumulation_steps
+                total_loss_D_epoch += loss_D.item()
 
-                loss_D = (loss_D_real + loss_D_fake) * 0.5
-
-            self.optimizer_G.zero_grad()
             with autocast(
                 device_type=self.device.type, enabled=self.config.get("use_amp", True)
             ):
-                loss_G_recon, loss_dict = self.criterion(restored, clean, epoch)
-                total_loss_G = loss_G_recon
+                batch_size = restored.shape[0]
+                k = max(1, int(batch_size * ohem_percent))
+
+                hard_restored = restored
+                hard_clean = clean
+
+                if k < batch_size:
+                    with torch.no_grad():
+                        l1_loss_per_sample = F.l1_loss(
+                            restored, clean, reduction="none"
+                        ).mean(dim=[1, 2, 3])
+
+                    _, top_k_indices = torch.topk(l1_loss_per_sample, k=k)
+
+                    hard_restored = restored[top_k_indices]
+                    hard_clean = clean[top_k_indices]
+
+                loss_dict = {}
+                total_loss_G = torch.tensor(0.0, device=self.device)
+
+                l1_weight = self.config.get("l1_weight", 0.0)
+                if l1_weight > 0:
+                    loss_G_l1 = self.l1_loss(hard_restored, hard_clean)
+                    loss_dict["l1_ohem"] = loss_G_l1.item()
+                    total_loss_G += l1_weight * loss_G_l1
+
+                lpips_weight = self.config.get("lpips_weight", 0.0)
+                if lpips_weight > 0 and self.lpips_metric:
+                    loss_G_lpips = self.lpips_metric(
+                        hard_restored * 2 - 1, hard_clean * 2 - 1
+                    ).mean()
+                    loss_dict["lpips_ohem"] = loss_G_lpips.item()
+                    total_loss_G += lpips_weight * loss_G_lpips
+
+                fft_weight = self.config.get("fft_weight", 0.0)
+                if fft_weight > 0:
+                    pred_fft = torch.fft.fft2(hard_restored, dim=(-2, -1))
+                    target_fft = torch.fft.fft2(hard_clean, dim=(-2, -1))
+                    loss_G_fft = F.l1_loss(pred_fft.real, target_fft.real) + F.l1_loss(
+                        pred_fft.imag, target_fft.imag
+                    )
+                    loss_dict["fft_ohem"] = loss_G_fft.item()
+                    total_loss_G += fft_weight * loss_G_fft
 
                 if self.config.get("use_gan"):
-                    pred_gen = self.discriminator(restored)
+                    pred_gen = self.discriminator(hard_restored)
                     loss_G_gan = self.gan_loss(pred_gen, torch.ones_like(pred_gen))
                     total_loss_G = (
                         total_loss_G + self.config.get("gan_weight", 0.1) * loss_G_gan
                     )
-                    loss_dict["gan"] = loss_G_gan.item()
+                    loss_dict["gan_ohem"] = loss_G_gan.item()
 
-            self.scaler_G.scale(total_loss_G).backward()
-            if self.config.get("grad_clip", 0) > 0:
-                self.scaler_G.unscale_(self.optimizer_G)
-                torch.nn.utils.clip_grad_norm_(
-                    self.generator.parameters(), self.config["grad_clip"]
-                )
-            self.scaler_G.step(self.optimizer_G)
-            self.scaler_G.update()
+            total_loss_G_norm = total_loss_G / accumulation_steps
+
+            self.scaler_G.scale(total_loss_G_norm).backward()
+            total_loss_G_epoch += total_loss_G.item()
+
+            if (batch_idx + 1) % accumulation_steps == 0:
+
+                if self.config.get("use_gan"):
+                    if self.config.get("grad_clip", 0) > 0:
+                        self.scaler_D.unscale_(self.optimizer_D)
+                        torch.nn.utils.clip_grad_norm_(
+                            self.discriminator.parameters(), self.config["grad_clip"]
+                        )
+                    self.scaler_D.step(self.optimizer_D)
+                    self.scaler_D.update()
+                    self.optimizer_D.zero_grad()
+
+                if self.config.get("grad_clip", 0) > 0:
+                    self.scaler_G.unscale_(self.optimizer_G)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.generator.parameters(), self.config["grad_clip"]
+                    )
+                self.scaler_G.step(self.optimizer_G)
+                self.scaler_G.update()
+                self.optimizer_G.zero_grad()
+
+                if self.config.get("use_ema"):
+                    self.ema.update()
 
             self.scheduler.step()
-            if self.config.get("use_ema"):
-                self.ema.update()
-
             self.global_step += 1
 
             progress_bar.set_postfix(
                 {
-                    "G_Loss": f"{total_loss_G.item():.4f}",
+                    "G_Loss_OHEM": f"{total_loss_G.item():.4f}",
                     "D_Loss": (
                         f"{loss_D.item():.4f}" if self.config.get("use_gan") else "N/A"
                     ),
@@ -808,7 +885,7 @@ class Trainer:
 
             if batch_idx % 100 == 0:
                 self.writer.add_scalar(
-                    "Loss/G_Total", total_loss_G.item(), self.global_step
+                    "Loss/G_Total_OHEM", total_loss_G.item(), self.global_step
                 )
                 for name, value in loss_dict.items():
                     self.writer.add_scalar(
@@ -823,7 +900,8 @@ class Trainer:
                 )
                 check_gpu_temp(self.device)
 
-        return total_loss_G.item()
+        avg_loss_G = total_loss_G_epoch / len(self.train_loader)
+        return avg_loss_G
 
     @torch.no_grad()
     def validate(self, epoch):
@@ -910,7 +988,7 @@ class Trainer:
     def log_internal_visualizations(
         self, internals: Dict[str, torch.Tensor], epoch: int
     ):
-        """Memproses dan menyimpan visualisasi internal ke TensorBoard."""
+        """Processes and saves internal visualizations to TensorBoard."""
         for name, tensor in internals.items():
             if tensor.dim() != 4:
                 continue
@@ -977,7 +1055,7 @@ class Trainer:
             is_best_lpips = lpips_score is not None and lpips_score < self.best_lpips
             if is_best_lpips:
                 self.best_lpips = lpips_score
-                self.logger.info(f"🏆 New best LPIPS: {lpips_score:.4f}")
+                self.logger.info(f"🏆 New best LPIPS: {lpips_score:.6f}")
                 patience_counter = 0
             elif not is_best:
                 patience_counter += 1
@@ -1030,3 +1108,17 @@ class Trainer:
         self.writer.close()
 
         return self.best_lpips, training_time
+
+    def _get_current_ohem_percent(self, epoch: int) -> float:
+        """Gets the OHEM percentage for the current epoch based on the schedule."""
+        schedule = self.config.get("ohem_schedule", [])
+        if not schedule:
+            return self.config.get("ohem_percent", 1.0)
+
+        current_percent = self.config.get("ohem_percent", 1.0)
+        for schedule_epoch, percent in sorted(schedule, key=lambda x: x[0]):
+            if epoch >= schedule_epoch:
+                current_percent = percent
+            else:
+                break
+        return current_percent
