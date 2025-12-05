@@ -980,34 +980,8 @@ class Trainer:
             global_step=epoch,
         )
 
-        self.log_internal_visualizations(internals, epoch)
-
         if self.config.get("use_ema"):
             self.ema.restore()
-
-    def log_internal_visualizations(
-        self, internals: Dict[str, torch.Tensor], epoch: int
-    ):
-        """Processes and saves internal visualizations to TensorBoard."""
-        for name, tensor in internals.items():
-            if tensor.dim() != 4:
-                continue
-
-            tensor_vis = tensor[0:1]
-
-            if tensor_vis.shape[1] == 1:
-                feature_map_grid = tensor_vis
-            else:
-                feature_map_grid = torch.mean(tensor_vis, dim=1, keepdim=True)
-
-            feature_map_grid -= feature_map_grid.min()
-            feature_map_grid /= feature_map_grid.max()
-
-            self.writer.add_image(
-                f"Internals/{name}",
-                feature_map_grid.squeeze(0),
-                global_step=epoch,
-            )
 
     @torch.no_grad()
     def calculate_lpips_on_subset(self, num_batches=16):

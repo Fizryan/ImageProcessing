@@ -3,7 +3,7 @@
 
 TRAINING_CONFIG = {
     # --- General ---
-    "task_type": "inpainting",  # 'demosaic', 'inpainting', or 'deblur'
+    "task_type": "demosaic",  # 'demosaic', 'inpainting'
     "model_size": "efficient",
     "checkpoint_dir": "Training/checkpoints",
     "preview_dir": "Training/previews",

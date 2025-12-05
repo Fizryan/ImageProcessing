@@ -32,7 +32,7 @@ else:
     STUDY_NAME = "scratch_hpo"
     HPO_MAIN_DIR = Path("Training/optuna_from_scratch")
     logging.info("🚀 Training Mode: FROM SCRATCH")
-    N_TRIALS_TO_RUN = 50
+    N_TRIALS_TO_RUN = 100
 
 
 def objective(trial: optuna.trial.Trial) -> float:
