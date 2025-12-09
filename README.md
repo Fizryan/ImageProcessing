@@ -16,11 +16,17 @@ An end-to-end, PyTorch-based pipeline for training and deploying deep learning m
     -   **Inpainting**: Filling in missing or corrupted parts of an image.
     -   *(Also includes separate utilities for grayscale conversion and image resizing)*
 -   **Advanced U-Net Architecture**: Utilizes a powerful and efficient `AdvancedUNet` model for high-quality image reconstruction.
+-   **🎯 Tiled Inference for Large Images**: Process 1920x1080+ images on GPUs with limited VRAM (6GB) without OOM errors:
+    -   Adaptive sliding window with seamless blending
+    -   Automatic activation during training validation
+    -   Recommended for RTX 4050 6GB and similar GPUs
+    -   See `TILED_INFERENCE_GUIDE.md` for detailed usage
 -   **High-Performance Training**: Optimized for speed and efficiency with:
     -   Mixed-Precision Training (AMP) on CUDA devices.
     -   `torch.compile` for model optimization (for PyTorch 2.0+).
     -   Gradient Accumulation to simulate larger batch sizes.
     -   Checkpointing system to resume training and save the best models.
+    -   Auto-tiled validation for large validation images
 -   **Interactive CLI**: A user-friendly command-line menu to easily run any part of the pipeline.
 -   **Automated Dataset Preparation**: Scripts to automatically download, resize, and generate corrupted image pairs for training.
 
@@ -142,6 +148,47 @@ After training, use the best model to restore corrupted images.
     -   The `task_type` (e.g., `noise`, `mosaic`, `inpainting`) to help the model process the input correctly.
 
 The restored image will be saved to the specified output path.
+
+### 🎯 Tiled Inference for Large Images (1920x1080+)
+
+For high-resolution images on GPUs with limited VRAM (e.g., RTX 4050 6GB), use **tiled inference**:
+
+#### Quick Start Example
+
+```python
+from program.Inference import ImageRestorer
+from PIL import Image
+
+# Load model
+restorer = ImageRestorer(
+    model_path="Training/checkpoints/best_model.pth",
+    img_width=448,
+    img_height=256
+)
+
+# Restore 1920x1080 image with tiling
+image = Image.open("input_1920x1080.jpg")
+result = restorer.restore_image(
+    image,
+    tile_size=(480, 272),  # Recommended for 1920x1080
+    overlap=32,            # Prevents seam artifacts
+    use_tta=True
+)
+result.save("output.png")
+```
+
+#### Run Demo Script
+
+```bash
+python example_tiled_inference.py
+```
+
+**📖 Full Documentation**: See `TILED_INFERENCE_GUIDE.md` for:
+- Why tiling is essential for large images
+- Optimal tile size calculations
+- Training with large validation images
+- Troubleshooting OOM errors
+- Technical deep dive
 
 ## 🛠️ Technology Stack
 

@@ -15,18 +15,19 @@ logger = logging.getLogger(__name__)
 
 
 def check_gpu_temp(device, threshold: float = 85, delay: int = 15):
-    """Checks GPU temperature and pauses if it exceeds a threshold."""
+    """Checks GPU temperature and pauses if it exceeds a threshold with progressive cooling."""
     if not getGPUs or device.type != "cuda":
         return
 
     try:
         gpu = getGPUs()[0]
         temperature = gpu.temperature
-        if temperature >= threshold:
-            # logger.warning(
-            #     f"GPU temperature high: {temperature}°C. Cooling down for {delay} seconds."
-            # )
+
+        if temperature >= threshold + 4:
+            time.sleep(delay * 2)
+        elif temperature >= threshold:
             time.sleep(delay)
+
     except Exception as e:
         logger.error(f"GPU temperature check failed: {e}")
 

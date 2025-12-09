@@ -16,7 +16,7 @@ from torch.amp import autocast
 from torchvision import transforms
 from tqdm import tqdm
 
-from program.Architecture import EfficientUNet
+from program.Architecture import SOTARestorationUNet
 from program.Utils import load_model_weights
 
 
@@ -75,7 +75,7 @@ class ImageRestorer:
                 "No config found in checkpoint. Using provided/default parameters."
             )
             base_channels = self.base_channels
-            self.mosaic_block_size = 16  # Fallback
+            self.mosaic_block_size = 16
 
         out_channels = 1 if self.is_detector else 3
 
@@ -151,40 +151,59 @@ class ImageRestorer:
 
     @staticmethod
     def _generate_blend_mask(patch_size: Tuple[int, int], device: torch.device):
-        """Generates a blending mask (Hann window) for smooth patch merging."""
         patch_w, patch_h = patch_size
         hann_h = torch.hann_window(patch_h * 2, periodic=False, device=device)[:patch_h]
         hann_w = torch.hann_window(patch_w * 2, periodic=False, device=device)[:patch_w]
         blend_mask = hann_h.unsqueeze(1) * hann_w.unsqueeze(0)
         return blend_mask.view(1, 1, patch_h, patch_w)
 
-    def _run_sliding_window(self, image_pil: Image.Image) -> Image.Image:
-        """
-        Performs inference using a sliding window of overlapping patches
-        and blends the results for a seamless output.
-        """
+    def _run_sliding_window(
+        self,
+        image_pil: Image.Image,
+        tile_size: Optional[Tuple[int, int]] = None,
+        overlap: int = 32,
+    ) -> Image.Image:
         with torch.no_grad():
             img_tensor = transforms.ToTensor()(image_pil).unsqueeze(0).to(self.device)
             b, c, h, w = img_tensor.shape
 
-            patch_w, patch_h = self.target_size
-            stride_h = patch_h // 2
-            stride_w = patch_w // 2
+            if tile_size is None:
+                patch_w, patch_h = self.target_size
+            else:
+                patch_w, patch_h = tile_size
 
-            # Pad the image to be a multiple of the stride
+            if patch_w <= 0 or patch_h <= 0:
+                raise ValueError("Invalid tile_size specified for sliding window.")
+
+            if overlap and overlap > 0:
+                stride_w = max(1, patch_w - overlap)
+                stride_h = max(1, patch_h - overlap)
+            else:
+                stride_h = max(1, patch_h // 2)
+                stride_w = max(1, patch_w // 2)
+
             pad_h = (stride_h - (h - patch_h) % stride_h) % stride_h
             pad_w = (stride_w - (w - patch_w) % stride_w) % stride_w
             padded_tensor = F.pad(img_tensor, (0, pad_w, 0, pad_h), "reflect")
             _, _, padded_h, padded_w = padded_tensor.shape
 
-            # Prepare accumulator and divisor tensors
-            result_accumulator = torch.zeros_like(padded_tensor)
-            divisor = torch.zeros_like(padded_tensor)
+            # Initialize accumulation buffers with float32 for high precision
+            # Even when using FP16 inference, accumulator must be float32 to avoid rounding errors
+            result_accumulator = torch.zeros(
+                (b, c, padded_h, padded_w),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            divisor = torch.zeros(
+                (b, c, padded_h, padded_w),
+                dtype=torch.float32,
+                device=self.device,
+            )
 
-            # Generate blending mask
-            blend_mask = self._generate_blend_mask(self.target_size, self.device)
+            # Generate blending mask (must be float32 for accurate blending)
+            blend_mask = self._generate_blend_mask((patch_w, patch_h), self.device)
+            blend_mask = blend_mask.float()  # Force float32
 
-            # Collect all patches
             patches = []
             patch_coords = []
             for y in range(0, padded_h - patch_h + 1, stride_h):
@@ -193,7 +212,6 @@ class ImageRestorer:
                     patches.append(patch)
                     patch_coords.append((y, x))
 
-            # Process patches in batches
             batch_size = self.config.get("val_batch_size", 4)
             results = []
             for i in tqdm(
@@ -212,40 +230,53 @@ class ImageRestorer:
                     output_batch = self.model(batch_patches)
                 results.extend([p.cpu() for p in output_batch])
 
-            # Accumulate results
             for i, (y, x) in enumerate(patch_coords):
                 patch_result = results[i].to(self.device).unsqueeze(0)
+
+                patch_result = patch_result.float()
+
                 result_accumulator[:, :, y : y + patch_h, x : x + patch_w] += (
                     patch_result * blend_mask
                 )
                 divisor[:, :, y : y + patch_h, x : x + patch_w] += blend_mask
 
-            # Normalize the result
+            divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
+
             final_tensor = (result_accumulator / divisor).clamp(0, 1)
 
-            # Crop back to original size
             final_tensor_cropped = final_tensor[:, :, :h, :w]
 
             return transforms.ToPILImage()(final_tensor_cropped.squeeze(0).cpu())
 
-    def _apply_tta(self, image_pil: Image.Image) -> Image.Image:
-        """Applies Test-Time Augmentation for improved quality."""
+    def _apply_tta(
+        self,
+        image_pil: Image.Image,
+        tile_size: Optional[Tuple[int, int]] = None,
+        overlap: int = 32,
+    ) -> Image.Image:
         self.logger.info("Applying Test-Time Augmentation (TTA)...")
-        result = self._run_sliding_window(image_pil)
+        result = self._run_sliding_window(
+            image_pil, tile_size=tile_size, overlap=overlap
+        )
 
         flipped_img = image_pil.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        flipped_result = self._run_sliding_window(flipped_img)
+        flipped_result = self._run_sliding_window(
+            flipped_img, tile_size=tile_size, overlap=overlap
+        )
         unflipped_result = flipped_result.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
 
         vflipped_img = image_pil.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
-        vflipped_result = self._run_sliding_window(vflipped_img)
+        vflipped_result = self._run_sliding_window(
+            vflipped_img, tile_size=tile_size, overlap=overlap
+        )
         unvflipped_result = vflipped_result.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
 
         rotated_img = image_pil.rotate(90, expand=True)
-        rotated_result = self._run_sliding_window(rotated_img)
+        rotated_result = self._run_sliding_window(
+            rotated_img, tile_size=tile_size, overlap=overlap
+        )
         unrotated_result = rotated_result.rotate(-90, expand=True)
 
-        # Ensure all results have the same size as the base result before blending
         if result.size != unflipped_result.size:
             unflipped_result = unflipped_result.resize(
                 result.size, Image.Resampling.LANCZOS
@@ -254,7 +285,6 @@ class ImageRestorer:
             unvflipped_result = unvflipped_result.resize(
                 result.size, Image.Resampling.LANCZOS
             )
-        # The rotated image might have a different aspect ratio, so we must resize it back.
         if result.size != unrotated_result.size:
             unrotated_result = unrotated_result.resize(
                 result.size, Image.Resampling.LANCZOS
@@ -274,7 +304,6 @@ class ImageRestorer:
         if image.size != original_size:
             image = image.resize(original_size, Image.Resampling.LANCZOS)
 
-        # A slight sharpening can help after demosaicing
         enhancer = ImageEnhance.Sharpness(image)
         image = enhancer.enhance(1.1)
         enhancer = ImageEnhance.Contrast(image)
@@ -288,6 +317,8 @@ class ImageRestorer:
         iterations: int = 1,
         use_tta: bool = True,
         final_blend_alpha: float = 0.0,
+        tile_size: Optional[Tuple[int, int]] = None,
+        overlap: int = 32,
         mask_pil: Optional[Image.Image] = None,
     ) -> Image.Image:
         start_time = time.time()
@@ -301,9 +332,13 @@ class ImageRestorer:
         )
         for i in pbar:
             if use_tta:
-                current_image = self._apply_tta(current_image)
+                current_image = self._apply_tta(
+                    current_image, tile_size=tile_size, overlap=overlap
+                )
             else:
-                current_image = self._run_sliding_window(current_image)
+                current_image = self._run_sliding_window(
+                    current_image, tile_size=tile_size, overlap=overlap
+                )
         result = current_image
 
         if final_blend_alpha > 0.0:
@@ -317,11 +352,9 @@ class ImageRestorer:
 
         if mask_pil:
             self.logger.info("Applying detected mask to composite final image.")
-            # Ensure mask is the same size as the final result and is in 'L' mode
             mask_pil = mask_pil.resize(result.size, Image.Resampling.NEAREST).convert(
                 "L"
             )
-            # Composite the restored image onto the original where the mask is white
             result = Image.composite(result, image_pil, mask_pil)
 
         processing_time = time.time() - start_time
@@ -330,14 +363,11 @@ class ImageRestorer:
         return result
 
     def detect_mask(self, image_pil: Image.Image) -> Image.Image:
-        """Runs the detector model on an image and returns the predicted mask."""
         if not self.is_detector:
             raise RuntimeError(
                 "This ImageRestorer instance is not configured as a detector."
             )
 
-        # For detector, we can use a simpler, single-pass resize logic
-        # as it's less sensitive to high-frequency details.
         with torch.no_grad():
             padded_img, paste_box = self._resize_with_padding(
                 image_pil.convert("RGB"), self.target_size
@@ -353,7 +383,6 @@ class ImageRestorer:
             mask_pil_padded = transforms.ToPILImage()(mask_tensor)
             mask_pil_cropped = mask_pil_padded.crop(paste_box)
 
-            # Resize back to original image size
             return mask_pil_cropped.resize(image_pil.size, Image.Resampling.LANCZOS)
 
     def restore_image_from_path(
@@ -363,6 +392,8 @@ class ImageRestorer:
         iterations: int = 1,
         use_tta: bool = True,
         final_blend_alpha: float = 0.0,
+        tile_size: Optional[Tuple[int, int]] = None,
+        overlap: int = 32,
     ) -> bool:
 
         if not input_path.exists():
@@ -376,6 +407,8 @@ class ImageRestorer:
                     iterations=iterations,
                     use_tta=use_tta,
                     final_blend_alpha=final_blend_alpha,
+                    tile_size=tile_size,
+                    overlap=overlap,
                 )
 
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,8 +433,9 @@ class ImageRestorer:
         iterations: int = 1,
         use_tta: bool = True,
         final_blend_alpha: float = 0.0,
+        tile_size: Optional[Tuple[int, int]] = None,
+        overlap: int = 32,
     ) -> None:
-
         input_dir = Path(input_dir)
         output_dir = Path(output_dir)
 
@@ -430,6 +464,8 @@ class ImageRestorer:
                 iterations,
                 use_tta,
                 final_blend_alpha,
+                tile_size,
+                overlap,
             ):
                 success_count += 1
 

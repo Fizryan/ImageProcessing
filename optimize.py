@@ -96,9 +96,9 @@ def objective(trial: optuna.trial.Trial) -> float:
             "discriminator_lr", 1e-5, 1e-3, log=True
         )
 
-    config["dataloader_params"]["batch_size"] = trial.suggest_categorical(
-        "batch_size", [1, 2, 4, 8]
-    )
+    # config["dataloader_params"]["batch_size"] = trial.suggest_categorical(
+    #     "batch_size", [1, 2, 4, 8]
+    # )
     config["use_sharpness_loss"] = False
     config["use_advanced_loss"] = False
     config["trial_number"] = trial.number

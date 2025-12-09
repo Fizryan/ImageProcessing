@@ -26,6 +26,7 @@ from program.MaskGenerator import MaskGenerator
 from program.BlurGenerator import BlurGenerator, apply_blur
 from program.Training import Trainer
 from program.Inference import ImageRestorer
+from program.Inference_Video import VideoRestorer
 from program.MaskDetector_Training import MaskDetectorTrainer
 from program.MaskDetector_Training_Config import DETECTOR_TRAINING_CONFIG
 
@@ -388,6 +389,45 @@ def handle_full_pipeline():
     logger.info("Full pipeline completed.")
 
 
+def handle_video_restoration():
+    logger.info("Starting video restoration process...")
+    model_path = get_user_input(
+        "Model checkpoint path", "Training/checkpoints/best_model.pth"
+    )
+    input_video = get_user_input("Input video path", "dataset/test_full_1.mp4")
+    output_video = get_user_input("Output video path", "Results/restored_video.mp4")
+    tile_width = get_user_input("Tile width (px)", 448, int)
+    tile_height = get_user_input("Tile height (px)", 256, int)
+    overlap = get_user_input("Tile overlap (px)", 32, int)
+    merge_audio = (
+        get_user_input("Merge audio from original video? (yes/no)", "yes", str).lower()
+        == "yes"
+    )
+    show_preview = (
+        get_user_input("Show preview during processing? (yes/no)", "no", str).lower()
+        == "yes"
+    )
+
+    restorer = VideoRestorer(
+        model_path=model_path,
+        tile_size=(tile_width, tile_height),
+        overlap=overlap,
+        use_amp=True,
+    )
+
+    success = restorer.process_video(
+        input_path=input_video,
+        output_path=output_video,
+        show_preview=show_preview,
+        merge_audio=merge_audio,
+    )
+
+    if success:
+        logger.info(f"✅ Video restoration completed: {output_video}")
+    else:
+        logger.error("❌ Video restoration failed")
+
+
 def handle_inference():
     logger.info("Starting image restoration process...")
 
@@ -429,6 +469,7 @@ def display_menu():
     print("--- Inference ---")
     print("11. Run Inference (Menu)")
     print("12. Run Full Pipeline (Detect & Demosaic)")
+    print("13. Restore Video (Streaming Inference)")
     print("")
     print(" 0. Exit")
     print("=" * 28)
@@ -468,6 +509,7 @@ def main():
         "10": ("Train Mosaic Detector Model", handle_train_detector),
         "11": ("Run Inference (Menu)", handle_inference),
         "12": ("Run Full Pipeline (Detect & Demosaic)", handle_full_pipeline),
+        "13": ("Restore Video (Streaming Inference)", handle_video_restoration),
     }
 
     start_time = time.time()

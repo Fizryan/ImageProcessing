@@ -20,7 +20,7 @@ from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 from tqdm.auto import tqdm
 
-from program.Architecture import EfficientUNet
+from program.Architecture import SOTARestorationUNet
 from program.Utils import check_gpu_temp, load_model_weights
 
 

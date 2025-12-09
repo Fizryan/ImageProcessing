@@ -5,3 +5,4 @@ requests
 opencv-python
 torchmetrics
 scikit-learn
+ffmpeg-python
