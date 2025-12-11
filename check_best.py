@@ -1,6 +1,4 @@
 # check_best.py
-# Script to launch the Optuna Dashboard for study visualization.
-
 import os
 import subprocess
 import sys

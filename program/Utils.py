@@ -1,20 +1,18 @@
-# program/Utils.py
-# This module provides shared utility functions for the application.
+# Utils.py
 
-import logging
 import time
 import torch
+from program.LoggingSetup import setup_logger
 
 try:
     from GPUtil import getGPUs
 except ImportError:
     getGPUs = None
-    logging.warning("GPUtil not available. GPU temp monitoring disabled.")
 
-logger = logging.getLogger(__name__)
+logger = setup_logger(__name__)
 
 
-def check_gpu_temp(device, threshold: float = 85, delay: int = 15):
+def check_gpu_temp(device, threshold: float = 84, delay: int = 15):
     """Checks GPU temperature and pauses if it exceeds a threshold with progressive cooling."""
     if not getGPUs or device.type != "cuda":
         return

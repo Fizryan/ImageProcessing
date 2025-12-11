@@ -1,7 +1,6 @@
 # Inference.py
 # This module contains the inference logic for the image restoration model.
 
-import logging
 from pathlib import Path
 from typing import Literal, Optional, Tuple, Union, List
 import time
@@ -17,7 +16,8 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from program.Architecture import SOTARestorationUNet
-from program.Utils import load_model_weights
+from program.Utils import load_model_weights, check_gpu_temp
+from program.LoggingSetup import setup_logger
 
 
 class ImageRestorer:
@@ -31,7 +31,7 @@ class ImageRestorer:
         is_detector: bool = False,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = setup_logger(self.__class__.__name__)
         self.target_size = (img_width, img_height)
         self.base_channels = base_channels
         self.model_size = model_size
@@ -48,12 +48,29 @@ class ImageRestorer:
         self.logger.info(f"Loading model from {model_path}")
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
 
+        if "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        elif "ema_state_dict" in checkpoint:
+            state_dict = checkpoint["ema_state_dict"]
+        else:
+            state_dict = checkpoint
+
+        if "intro.weight" in state_dict:
+            base_channels = state_dict["intro.weight"].shape[0]
+            self.logger.info(
+                f"Detected base_channels={base_channels} from checkpoint weights"
+            )
+        else:
+            base_channels = self.base_channels
+            self.logger.warning(
+                f"Could not detect base_channels, using default: {base_channels}"
+            )
+
         if "config" in checkpoint and isinstance(checkpoint["config"], dict):
             self.logger.info(
-                "Found config in checkpoint. Initializing model from saved config."
+                "Found config in checkpoint. Loading additional parameters."
             )
             self.config = checkpoint["config"]
-            base_channels = self.config.get("base_channels", self.base_channels)
             self.model_size = self.config.get("model_size", self.model_size)
             self.target_size = (
                 self.config.get("img_width", self.target_size[0]),
@@ -65,16 +82,15 @@ class ImageRestorer:
             self.mosaic_block_size_info = mosaic_config
 
             self.logger.info(
-                f"Loaded parameters from checkpoint: "
+                f"Loaded parameters: "
                 f"patch_size={self.target_size}, "
                 f"base_channels={base_channels}, "
                 f"mosaic_block_size_info={self.mosaic_block_size_info}"
             )
         else:
             self.logger.warning(
-                "No config found in checkpoint. Using provided/default parameters."
+                "No config found in checkpoint. Using detected/default parameters."
             )
-            base_channels = self.base_channels
             self.mosaic_block_size = 16
 
         out_channels = 1 if self.is_detector else 3
@@ -82,9 +98,9 @@ class ImageRestorer:
         use_global_residual = not self.is_detector
 
         self.logger.info(
-            f"Attempting to load model with architecture: '{self.model_size}'"
+            f"Initializing SOTARestorationUNet with base_channels={base_channels}"
         )
-        model: nn.Module = EfficientUNet(
+        model: nn.Module = SOTARestorationUNet(
             in_channels=3,
             out_channels=out_channels,
             base_channels=base_channels,
@@ -99,8 +115,8 @@ class ImageRestorer:
                 self.logger.info("Reconfigured model output layer for detector mode.")
 
         try:
-            state_dict = checkpoint.get("model_state_dict", checkpoint)
             load_model_weights(model, state_dict)
+            self.logger.info("Model weights loaded successfully")
         except Exception as e:
             self.logger.error(f"Failed to load model weights: {e}", exc_info=True)
             raise
@@ -165,88 +181,69 @@ class ImageRestorer:
     ) -> Image.Image:
         with torch.no_grad():
             img_tensor = transforms.ToTensor()(image_pil).unsqueeze(0).to(self.device)
+
+            if self.device.type == "cuda":
+                img_tensor = img_tensor.half()
+
             b, c, h, w = img_tensor.shape
 
             if tile_size is None:
-                patch_w, patch_h = self.target_size
+                patch_w, patch_h = 448, 256
             else:
                 patch_w, patch_h = tile_size
 
-            if patch_w <= 0 or patch_h <= 0:
-                raise ValueError("Invalid tile_size specified for sliding window.")
-
-            if overlap and overlap > 0:
-                stride_w = max(1, patch_w - overlap)
-                stride_h = max(1, patch_h - overlap)
-            else:
-                stride_h = max(1, patch_h // 2)
-                stride_w = max(1, patch_w // 2)
-
-            pad_h = (stride_h - (h - patch_h) % stride_h) % stride_h
-            pad_w = (stride_w - (w - patch_w) % stride_w) % stride_w
-            padded_tensor = F.pad(img_tensor, (0, pad_w, 0, pad_h), "reflect")
-            _, _, padded_h, padded_w = padded_tensor.shape
-
-            # Initialize accumulation buffers with float32 for high precision
-            # Even when using FP16 inference, accumulator must be float32 to avoid rounding errors
-            result_accumulator = torch.zeros(
-                (b, c, padded_h, padded_w),
-                dtype=torch.float32,
-                device=self.device,
-            )
-            divisor = torch.zeros(
-                (b, c, padded_h, padded_w),
-                dtype=torch.float32,
-                device=self.device,
-            )
-
-            # Generate blending mask (must be float32 for accurate blending)
-            blend_mask = self._generate_blend_mask((patch_w, patch_h), self.device)
-            blend_mask = blend_mask.float()  # Force float32
-
-            patches = []
-            patch_coords = []
-            for y in range(0, padded_h - patch_h + 1, stride_h):
-                for x in range(0, padded_w - patch_w + 1, stride_w):
-                    patch = padded_tensor[:, :, y : y + patch_h, x : x + patch_w]
-                    patches.append(patch)
-                    patch_coords.append((y, x))
-
-            batch_size = self.config.get("val_batch_size", 4)
-            results = []
-            for i in tqdm(
-                range(0, len(patches), batch_size),
-                desc="Processing Patches",
-                leave=False,
-            ):
-                batch_patches = torch.cat(patches[i : i + batch_size], dim=0)
-                if self.config.get("use_channels_last", True):
-                    batch_patches = batch_patches.to(memory_format=torch.channels_last)
-
-                with autocast(
-                    device_type=self.device.type,
-                    enabled=self.config.get("use_amp", True),
-                ):
-                    output_batch = self.model(batch_patches)
-                results.extend([p.cpu() for p in output_batch])
-
-            for i, (y, x) in enumerate(patch_coords):
-                patch_result = results[i].to(self.device).unsqueeze(0)
-
-                patch_result = patch_result.float()
-
-                result_accumulator[:, :, y : y + patch_h, x : x + patch_w] += (
-                    patch_result * blend_mask
+            if patch_w % 32 != 0 or patch_h % 32 != 0:
+                self.logger.warning(
+                    f"Tile size ({patch_w}x{patch_h}) not divisible by 32. "
+                    "Rounding to nearest multiple."
                 )
-                divisor[:, :, y : y + patch_h, x : x + patch_w] += blend_mask
+                patch_w = ((patch_w + 31) // 32) * 32
+                patch_h = ((patch_h + 31) // 32) * 32
 
-            divisor = torch.where(divisor == 0, torch.ones_like(divisor), divisor)
+            pad_h = (patch_h - (h % patch_h)) % patch_h
+            pad_w = (patch_w - (w % patch_w)) % patch_w
 
-            final_tensor = (result_accumulator / divisor).clamp(0, 1)
+            padded_img = F.pad(img_tensor, (0, pad_w, 0, pad_h), "reflect")
+            _, _, padded_h, padded_w = padded_img.shape
 
-            final_tensor_cropped = final_tensor[:, :, :h, :w]
+            self.logger.info(
+                f"Tiling: Original {w}x{h} → Padded {padded_w}x{padded_h} "
+                f"| Tile {patch_w}x{patch_h} | Grid {padded_w//patch_w}x{padded_h//patch_h}"
+            )
 
-            return transforms.ToPILImage()(final_tensor_cropped.squeeze(0).cpu())
+            output_tensor = torch.zeros_like(padded_img)
+
+            total_tiles = (padded_h // patch_h) * (padded_w // patch_w)
+            pbar = tqdm(total=total_tiles, desc="Processing Tiles", leave=False)
+
+            for y in range(0, padded_h, patch_h):
+                for x in range(0, padded_w, patch_w):
+                    patch = padded_img[:, :, y : y + patch_h, x : x + patch_w]
+
+                    with autocast(
+                        device_type=self.device.type,
+                        dtype=(
+                            torch.float16
+                            if self.device.type == "cuda"
+                            else torch.float32
+                        ),
+                    ):
+                        out_patch = self.model(patch)
+
+                    output_tensor[:, :, y : y + patch_h, x : x + patch_w] = (
+                        out_patch.float()
+                    )
+
+                    pbar.update(1)
+
+                    if self.device.type == "cuda" and pbar.n % 10 == 0:
+                        check_gpu_temp(self.device, threshold=85, delay=15)
+
+            pbar.close()
+
+            final_tensor = output_tensor[:, :, :h, :w]
+
+            return transforms.ToPILImage()(final_tensor.squeeze(0).cpu().clamp(0, 1))
 
     def _apply_tta(
         self,
@@ -301,13 +298,19 @@ class ImageRestorer:
     def _postprocess_image(
         self, image: Image.Image, original_size: tuple
     ) -> Image.Image:
+        """
+        Post-process restored image with minimal blur introduction.
+        Model output is already sharp - we just enhance edges slightly.
+        """
         if image.size != original_size:
-            image = image.resize(original_size, Image.Resampling.LANCZOS)
+            image = image.resize(original_size, Image.Resampling.BICUBIC)
 
-        enhancer = ImageEnhance.Sharpness(image)
-        image = enhancer.enhance(1.1)
+        image = image.filter(
+            ImageFilter.UnsharpMask(radius=0.5, percent=80, threshold=2)
+        )
+
         enhancer = ImageEnhance.Contrast(image)
-        image = enhancer.enhance(1.05)
+        image = enhancer.enhance(1.02)
 
         return image
 
@@ -315,11 +318,12 @@ class ImageRestorer:
         self,
         image_pil: Image.Image,
         iterations: int = 1,
-        use_tta: bool = True,
+        use_tta: bool = False,
         final_blend_alpha: float = 0.0,
         tile_size: Optional[Tuple[int, int]] = None,
         overlap: int = 32,
         mask_pil: Optional[Image.Image] = None,
+        enable_postprocess: bool = False,
     ) -> Image.Image:
         start_time = time.time()
 
@@ -339,6 +343,10 @@ class ImageRestorer:
                 current_image = self._run_sliding_window(
                     current_image, tile_size=tile_size, overlap=overlap
                 )
+
+            if self.device.type == "cuda":
+                check_gpu_temp(self.device, threshold=85, delay=15)
+
         result = current_image
 
         if final_blend_alpha > 0.0:
@@ -348,7 +356,11 @@ class ImageRestorer:
             resized_original = image_pil.resize(result.size, Image.Resampling.LANCZOS)
             result = Image.blend(result, resized_original, alpha=final_blend_alpha)
 
-        result = self._postprocess_image(result, original_size)
+        if enable_postprocess:
+            result = self._postprocess_image(result, original_size)
+        else:
+            if result.size != original_size:
+                result = result.resize(original_size, Image.Resampling.BICUBIC)
 
         if mask_pil:
             self.logger.info("Applying detected mask to composite final image.")
@@ -390,7 +402,7 @@ class ImageRestorer:
         input_path: Path,
         output_path: Path,
         iterations: int = 1,
-        use_tta: bool = True,
+        use_tta: bool = False,
         final_blend_alpha: float = 0.0,
         tile_size: Optional[Tuple[int, int]] = None,
         overlap: int = 32,
@@ -431,7 +443,7 @@ class ImageRestorer:
         input_dir: Union[str, Path],
         output_dir: Union[str, Path],
         iterations: int = 1,
-        use_tta: bool = True,
+        use_tta: bool = False,
         final_blend_alpha: float = 0.0,
         tile_size: Optional[Tuple[int, int]] = None,
         overlap: int = 32,
@@ -455,7 +467,7 @@ class ImageRestorer:
         success_count = 0
         pbar = tqdm(image_files, desc=f"Demosaicing images", ncols=100, leave=False)
 
-        for path in pbar:
+        for idx, path in enumerate(pbar):
             output_path = output_dir / path.name
 
             if self.restore_image_from_path(
@@ -468,5 +480,8 @@ class ImageRestorer:
                 overlap,
             ):
                 success_count += 1
+
+            if self.device.type == "cuda" and (idx + 1) % 5 == 0:
+                check_gpu_temp(self.device, threshold=85, delay=15)
 
             pbar.set_postfix({"success": f"{success_count}/{len(image_files)}"})

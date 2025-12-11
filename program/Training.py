@@ -1,35 +1,44 @@
 # Training.py
 
-import logging
 import time
-from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
 import json
+import random
 import torch
 import warnings
 import torch.nn as nn
-
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-import random
 import torch.nn.functional as F
 import torch.optim as optim
+from pathlib import Path
+from typing import Tuple, Dict, Any, Optional
 from PIL import Image
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 from torch.utils.tensorboard.writer import SummaryWriter
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchmetrics.image import (
     PeakSignalNoiseRatio,
     StructuralSimilarityIndexMeasure,
 )
-from torchvision import transforms, models
+from torchvision import transforms
 from torchvision.utils import make_grid, save_image
 from tqdm.auto import tqdm
 
-from program.Architecture import SOTARestorationUNet, get_model, PatchGANDiscriminator
+from program.Architecture import get_model, PatchGANDiscriminator
 from program.Utils import check_gpu_temp, load_model_weights
+from program.Losses import (
+    AdvancedRestorationLoss,
+    SharpnessOptimizedLoss,
+    LightPerceptualLoss,
+)
+from program.Augmentation import RobustDegradation
+from program.RestorationDataset import RestorationDataset, RandomScale
+from program.ModelEMA import ModelEMA
+from program.TrainerUtils import TrainerUtils
+from program.LoggingSetup import setup_logger, fmt_bool
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 try:
     import lpips
@@ -37,390 +46,9 @@ except ImportError:
     lpips = None
 
 
-class LightPerceptualLoss(nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        self.feature_extractor = self._build_feature_extractor().to(device).eval()
-        self.criterion = nn.L1Loss()
-
-        for param in self.feature_extractor.parameters():
-            param.requires_grad = False
-
-    def _build_feature_extractor(self):
-        layers = []
-        in_channels = 3
-        for out_channels in [32, 64, 128]:
-            layers.extend(
-                [
-                    nn.Conv2d(in_channels, out_channels, 3, padding=1),
-                    nn.ReLU(inplace=True),
-                    nn.MaxPool2d(2),
-                ]
-            )
-            in_channels = out_channels
-        return nn.Sequential(*layers)
-
-    def forward(self, pred, target):
-        pred_features = self.feature_extractor(pred)
-        target_features = self.feature_extractor(target)
-        return self.criterion(pred_features, target_features)
-
-
-class AdvancedRestorationLoss(nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        self.l1_loss = nn.L1Loss()
-        self.perceptual_loss = LightPerceptualLoss(device)
-
-    def fft_loss(self, pred, target):
-        pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
-        target_fft = torch.fft.fft2(target, dim=(-2, -1))
-        return F.l1_loss(pred_fft.real, target_fft.real) + F.l1_loss(
-            pred_fft.imag, target_fft.imag
-        )
-
-    def gradient_loss(self, pred, target):
-        pred_grad_x = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-        pred_grad_y = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-        target_grad_x = target[:, :, :, 1:] - target[:, :, :, :-1]
-        target_grad_y = target[:, :, 1:, :] - target[:, :, :-1, :]
-
-        return F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(
-            pred_grad_y, target_grad_y
-        )
-
-    def forward(self, pred, target, current_epoch):
-        losses = {
-            "l1": self.l1_loss(pred, target),
-            "perc": self.perceptual_loss(pred, target),
-            "fft": self.fft_loss(pred, target),
-            "grad": self.gradient_loss(pred, target),
-        }
-
-        if current_epoch < 25:
-            weights = {"l1": 0.6, "perc": 0.2, "fft": 0.1, "grad": 0.1}
-        else:
-            weights = {"l1": 0.2, "perc": 0.4, "fft": 0.2, "grad": 0.2}
-
-        total_loss = sum(weights.get(k, 0) * v for k, v in losses.items())
-        loss_dict = {k: v.item() for k, v in losses.items()}
-        loss_dict["total"] = total_loss.item()
-        return total_loss, loss_dict
-
-
-class SharpnessOptimizedLoss(nn.Module):
-    def __init__(self, device):
-        super().__init__()
-        self.l1_loss = nn.L1Loss()
-        self.perceptual_loss = LightPerceptualLoss(device)
-
-        laplacian_kernel = torch.tensor(
-            [[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32
-        ).view(1, 1, 3, 3)
-        self.laplacian_kernel = laplacian_kernel.repeat(3, 1, 1, 1).to(device)
-
-    def edge_aware_loss(self, pred, target):
-        pred_edges = F.conv2d(pred, self.laplacian_kernel, padding=1, groups=3)
-        target_edges = F.conv2d(target, self.laplacian_kernel, padding=1, groups=3)
-        return F.l1_loss(pred_edges, target_edges)
-
-    def frequency_band_loss(self, pred, target, low_freq_ratio=0.3):
-        pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
-        target_fft = torch.fft.fft2(target, dim=(-2, -1))
-
-        h, w = pred.shape[-2:]
-        y_freq = torch.fft.fftfreq(h, device=pred.device).abs().view(-1, 1)
-        x_freq = torch.fft.fftfreq(w, device=pred.device).abs().view(1, -1)
-        freq_mask = torch.sqrt(y_freq**2 + x_freq**2)
-
-        high_freq_mask = (freq_mask > low_freq_ratio).float()
-        high_freq_loss = F.l1_loss(
-            pred_fft * high_freq_mask, target_fft * high_freq_mask
-        )
-        return high_freq_loss
-
-    def forward(self, pred, target, current_epoch):
-        l1_loss = self.l1_loss(pred, target)
-        perc_loss = self.perceptual_loss(pred, target)
-        edge_loss = self.edge_aware_loss(pred, target)
-        freq_loss = self.frequency_band_loss(pred, target)
-
-        if current_epoch < 25:
-            weights = {"l1": 0.5, "perc": 0.2, "edge": 0.2, "freq": 0.1}
-        elif current_epoch < 60:
-            weights = {"l1": 0.3, "perc": 0.3, "edge": 0.25, "freq": 0.15}
-        else:
-            weights = {"l1": 0.2, "perc": 0.3, "edge": 0.3, "freq": 0.2}
-
-        total_loss = (
-            weights["l1"] * l1_loss
-            + weights["perc"] * perc_loss
-            + weights["edge"] * edge_loss
-            + weights["freq"] * freq_loss
-        )
-
-        losses = {
-            "total": total_loss.item(),
-            "l1": l1_loss.item(),
-            "perc": perc_loss.item(),
-            "edge": edge_loss.item(),
-            "freq": freq_loss.item(),
-        }
-        return total_loss, losses
-
-
-class RobustDegradation:
-    def __init__(self, config: Dict[str, Any]):
-        self.p = config.get("robust_degradation_prob", 0.5)
-        degradation_cfg = config.get("robust_degradation_config", {})
-        self.blur_prob = degradation_cfg.get("blur_prob", 0.3)
-        self.noise_prob = degradation_cfg.get("noise_prob", 0.3)
-        self.jpeg_prob = degradation_cfg.get("jpeg_prob", 0.3)
-        self.noise_std_range = degradation_cfg.get("noise_std_range", [0.01, 0.05])
-        self.jpeg_scale_range = degradation_cfg.get("jpeg_scale_range", [0.5, 0.9])
-
-    def __call__(self, img_tensor):
-        if random.random() > self.p:
-            return img_tensor
-
-        if random.random() < self.blur_prob:
-            kernel_size = random.choice([3, 5])
-            sigma = random.uniform(0.1, 2.0)
-            img_tensor = transforms.functional.gaussian_blur(
-                img_tensor, kernel_size, sigma
-            )
-
-        if random.random() < self.noise_prob:
-            noise_std = random.uniform(*self.noise_std_range)
-            noise = torch.randn_like(img_tensor) * noise_std
-            img_tensor = (img_tensor + noise).clamp(0, 1)
-
-        if random.random() < self.jpeg_prob:
-            _, h, w = img_tensor.shape
-            scale_factor = random.uniform(*self.jpeg_scale_range)
-            small = F.interpolate(
-                img_tensor.unsqueeze(0),
-                scale_factor=scale_factor,
-                mode="bilinear",
-                align_corners=False,
-            )
-            img_tensor = F.interpolate(
-                small, size=(h, w), mode="bilinear", align_corners=False
-            ).squeeze(0)
-
-        return img_tensor
-
-
-def compute_image_gradient(x):
-    dx = x[:, :, :, 1:] - x[:, :, :, :-1]
-    dy = x[:, :, 1:, :] - x[:, :, :-1, :]
-    dx = F.pad(dx, (0, 1, 0, 0))
-    dy = F.pad(dy, (0, 0, 0, 1))
-    return torch.sqrt(dx**2 + dy**2 + 1e-8)
-
-
-def create_pixelated_mosaic(
-    rgb_tensor: torch.Tensor, block_size: int = 16, use_grid_shift: bool = False
-) -> torch.Tensor:
-    _, h, w = rgb_tensor.shape
-
-    if use_grid_shift:
-        shift_x = random.randint(0, block_size - 1)
-        shift_y = random.randint(0, block_size - 1)
-
-        padded = F.pad(rgb_tensor, (shift_x, 0, shift_y, 0), mode="reflect")
-
-        ph, pw = padded.shape[1], padded.shape[2]
-
-        small_tensor = F.interpolate(
-            padded.unsqueeze(0),
-            size=(ph // block_size, pw // block_size),
-            mode="area",
-        )
-
-        pixelated_full = F.interpolate(
-            small_tensor, size=(ph, pw), mode="nearest"
-        ).squeeze(0)
-
-        pixelated_tensor = pixelated_full[
-            :, shift_y : shift_y + h, shift_x : shift_x + w
-        ]
-    else:
-        small_tensor = F.interpolate(
-            rgb_tensor.unsqueeze(0),
-            size=(h // block_size, w // block_size),
-            mode="area",
-        )
-        pixelated_tensor = F.interpolate(
-            small_tensor, size=(h, w), mode="nearest"
-        ).squeeze(0)
-
-    return pixelated_tensor
-
-
-class RestorationDataset(Dataset):
-    def __init__(
-        self,
-        clean_dir: Path,
-        mask_dir: Path,
-        image_size: Tuple[int, int],
-        transform=None,
-        mosaic_block_size_range: Tuple[int, int] = (16, 16),
-        mosaic_opacity_range: Tuple[float, float] = (1.0, 1.0),
-        use_masks=True,
-        task_type="demosaic",
-        keep_original_size=False,
-        use_mosaic_grid_shift: bool = False,
-        robust_degradation=None,
-    ):
-        self.clean_paths = sorted(
-            [
-                p
-                for p in clean_dir.iterdir()
-                if p.suffix.lower() in [".png", ".jpg", ".jpeg"]
-            ]
-        )
-        self.mask_dir = mask_dir
-        self.image_size = image_size
-        self.transform = transform
-        self.mosaic_block_size_range = mosaic_block_size_range
-        self.mosaic_opacity_range = mosaic_opacity_range
-        self.use_masks = use_masks
-        self.task_type = task_type
-        self.keep_original_size = keep_original_size
-        self.use_mosaic_grid_shift = use_mosaic_grid_shift
-        self.robust_degradation = robust_degradation
-
-    def __len__(self):
-        return len(self.clean_paths)
-
-    def __getitem__(self, idx):
-        clean_path = self.clean_paths[idx]
-        mask_path = self.mask_dir / clean_path.name
-
-        try:
-            clean_img = Image.open(clean_path).convert("RGB")
-
-            if not self.keep_original_size:
-                if self.transform:
-                    clean_tensor = self.transform(clean_img)
-                else:
-                    clean_tensor = transforms.ToTensor()(clean_img)
-                    clean_tensor = transforms.functional.resize(
-                        clean_tensor, self.image_size
-                    )
-
-                try:
-                    mask_img = Image.open(mask_path).convert("L")
-                    if self.transform:
-                        torch.manual_seed(idx)
-                        mask_tensor = self.transform(mask_img)
-                        if mask_tensor.shape[0] == 3:
-                            mask_tensor = mask_tensor[0:1]
-                    else:
-                        mask_tensor = transforms.ToTensor()(mask_img)
-                        mask_tensor = transforms.functional.resize(
-                            mask_tensor,
-                            self.image_size,
-                            interpolation=transforms.InterpolationMode.NEAREST,
-                        )
-                except FileNotFoundError:
-                    mask_tensor = torch.ones(1, *clean_tensor.shape[1:])
-
-                degraded_tensor = self._apply_degradation_with_mask(
-                    clean_tensor, mask_tensor
-                )
-
-            else:
-                clean_tensor = transforms.ToTensor()(clean_img)
-
-                try:
-                    mask_img = Image.open(mask_path).convert("L")
-                    mask_tensor = transforms.ToTensor()(mask_img)
-                except FileNotFoundError:
-                    mask_tensor = torch.ones(1, *clean_tensor.shape[1:])
-
-                degraded_tensor = self._apply_degradation_with_mask(
-                    clean_tensor, mask_tensor
-                )
-
-            return degraded_tensor, clean_tensor
-
-        except Exception as e:
-            logging.warning(f"Error processing {clean_path.name}: {e}, skipping.")
-            new_idx = (idx + 1) % len(self)
-            return self.__getitem__(new_idx)
-
-    def _apply_degradation_with_mask(self, clean_tensor, mask_tensor):
-        if self.task_type == "demosaic":
-            degraded_base = clean_tensor
-            if self.robust_degradation is not None:
-                degraded_base = self.robust_degradation(clean_tensor)
-
-            block_size = random.randint(*self.mosaic_block_size_range)
-            pixelated_tensor = create_pixelated_mosaic(
-                degraded_base,
-                block_size=block_size,
-                use_grid_shift=self.use_mosaic_grid_shift,
-            )
-            opacity = random.uniform(*self.mosaic_opacity_range)
-
-            mosaic_blend = (opacity * pixelated_tensor) + (
-                (1 - opacity) * degraded_base
-            )
-
-            mask_binary = (mask_tensor > 0.5).float()
-            degraded_tensor = torch.where(
-                mask_binary > 0.5, mosaic_blend, degraded_base
-            )
-            return degraded_tensor
-
-        elif self.task_type == "inpainting":
-            mask_binary = (mask_tensor > 0.5).float()
-            return torch.where(
-                mask_binary > 0.5, torch.ones_like(clean_tensor), clean_tensor
-            )
-
-        return clean_tensor
-
-
-class ModelEMA:
-    def __init__(self, model, decay=0.999):
-        self.model = model
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        self.register()
-
-    def register(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_average = (
-                    1.0 - self.decay
-                ) * param.data + self.decay * self.shadow[name]
-                self.shadow[name] = new_average.clone()
-
-    def apply_shadow(self):
-        self.backup = {}
-        for name, param in self.model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
-
-
 class Trainer:
+    """Main trainer class for image restoration models."""
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -431,12 +59,10 @@ class Trainer:
         torch.backends.cudnn.allow_tf32 = True
 
         self.setup_directories()
-
         self._log_augmentation_status()
-
         self.setup_data_loaders()
-
         self.initialize_model_only()
+
         if hasattr(torch, "compile") and self.config.get("compile_mode"):
             self.generator = torch.compile(
                 self.generator, mode=self.config["compile_mode"]
@@ -444,10 +70,23 @@ class Trainer:
 
         self.initialize_optimizers_and_schedulers()
         self.initialize_remaining_components()
-
         self.load_checkpoint()
 
     def _log_augmentation_status(self):
+        """Log active augmentation features."""
+        scale_range = self.config.get("scale_augmentation_range", [0.5, 1.0])
+        if scale_range[0] < 1.0:
+            self.logger.info("✓ Scale Augmentation (Multi-Resolution): ENABLED")
+            self.logger.info(
+                f"  - Scale Range: {scale_range[0]:.2f} to {scale_range[1]:.2f}"
+            )
+            self.logger.info(
+                f"  - Simulates: {int(scale_range[0]*1080)}p to {int(scale_range[1]*1080)}p"
+            )
+            self.logger.info("  → Makes model robust to ANY video resolution")
+        else:
+            self.logger.info("✗ Scale Augmentation: DISABLED (Fixed resolution only)")
+
         if self.config.get("use_robust_degradation", False):
             self.logger.info("✓ Robust Degradation: ENABLED (Blind Restoration)")
             self.logger.info(
@@ -479,6 +118,8 @@ class Trainer:
             self.logger.info("✗ Mosaic Grid Shift: DISABLED")
 
         enabled_features = []
+        if scale_range[0] < 1.0:
+            enabled_features.append("Multi-Res Training")
         if self.config.get("use_robust_degradation", False):
             enabled_features.append("Blind Restoration")
         if self.config.get("use_geometric_augmentation", False):
@@ -493,24 +134,9 @@ class Trainer:
             self.logger.info("Training Mode: BASIC (No advanced augmentation)")
 
     def setup_logging(self):
+        """Setup logging with consistent formatting."""
         log_file = self.config.get("log_file", "Training/training.log")
-        Path(log_file).parent.mkdir(exist_ok=True, parents=True)
-
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s | %(levelname)-7s | %(message)s",
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler(),
-            ],
-            force=True,
-        )
-        self.logger = logging.getLogger(__name__)
-
-        logging.getLogger("PIL").setLevel(logging.WARNING)
-        logging.getLogger("matplotlib").setLevel(logging.WARNING)
-        logging.getLogger("torch").setLevel(logging.WARNING)
-        logging.getLogger("torchvision").setLevel(logging.WARNING)
+        self.logger = setup_logger(__name__, log_file=log_file)
 
         if "tensorboard_log_dir" in self.config and "trial_number" in self.config:
             log_dir = (
@@ -522,12 +148,14 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=str(log_dir))
 
     def setup_directories(self):
+        """Create necessary directories."""
         self.checkpoint_dir = Path(self.config["checkpoint_dir"])
         self.preview_dir = Path(self.config["preview_dir"])
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.preview_dir.mkdir(parents=True, exist_ok=True)
 
     def initialize_model_only(self):
+        """Initialize generator and discriminator models."""
         model_class = get_model(self.config)
         self.logger.info(f"Using generator architecture: {model_class.__name__}")
         self.generator = model_class(**self.config.get("model_params", {})).to(
@@ -545,6 +173,7 @@ class Trainer:
                 )
 
     def initialize_optimizers_and_schedulers(self):
+        """Initialize optimizers and learning rate schedulers."""
         self.optimizer_G = optim.AdamW(
             self.generator.parameters(),
             lr=self.config["learning_rate"],
@@ -586,6 +215,7 @@ class Trainer:
             )
 
     def initialize_remaining_components(self):
+        """Initialize loss functions, metrics, and other components."""
         self.l1_loss = nn.L1Loss()
         self.perceptual_loss = LightPerceptualLoss(self.device)
 
@@ -602,6 +232,7 @@ class Trainer:
         self.scaler_G = GradScaler(enabled=self.config.get("use_amp", True))
         if self.config.get("use_gan"):
             self.scaler_D = GradScaler(enabled=self.config.get("use_amp", True))
+
         self.psnr_metric = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
         self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(
             self.device
@@ -623,16 +254,6 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
 
-    @staticmethod
-    def _generate_blend_mask_training(
-        patch_size: Tuple[int, int], device: torch.device
-    ):
-        patch_w, patch_h = patch_size
-        hann_h = torch.hann_window(patch_h * 2, periodic=False, device=device)[:patch_h]
-        hann_w = torch.hann_window(patch_w * 2, periodic=False, device=device)[:patch_w]
-        blend_mask = hann_h.unsqueeze(1) * hann_w.unsqueeze(0)
-        return blend_mask.view(1, 1, patch_h, patch_w)
-
     def _inference_with_tiling(
         self,
         model: nn.Module,
@@ -640,6 +261,7 @@ class Trainer:
         tile_size: Optional[Tuple[int, int]] = None,
         overlap: int = 32,
     ) -> torch.Tensor:
+        """Perform tiled inference for large images."""
         b, c, h, w = image_tensor.shape
 
         if tile_size is None:
@@ -666,7 +288,7 @@ class Trainer:
         result_accumulator = torch.zeros_like(padded_tensor)
         divisor = torch.zeros_like(padded_tensor)
 
-        blend_mask = self._generate_blend_mask_training((patch_w, patch_h), self.device)
+        blend_mask = TrainerUtils.generate_blend_mask((patch_w, patch_h), self.device)
 
         for y in range(0, padded_h - patch_h + 1, stride_h):
             for x in range(0, padded_w - patch_w + 1, stride_w):
@@ -684,9 +306,14 @@ class Trainer:
         return final_tensor[:, :, :h, :w]
 
     def setup_data_loaders(self):
+        """Setup training and validation data loaders."""
         image_size = (self.config["img_height"], self.config["img_width"])
 
         train_transform_list = [
+            RandomScale(
+                scale_range=self.config.get("scale_augmentation_range", (0.5, 1.0)),
+                target_crop_size=max(image_size),
+            ),
             transforms.RandomCrop(image_size),
             transforms.RandomHorizontalFlip(0.5),
         ]
@@ -761,6 +388,7 @@ class Trainer:
         self.val_iter = iter(self.val_loader)
 
     def load_checkpoint(self):
+        """Load checkpoint if exists."""
         finetune_path = self.config.get("finetune_checkpoint_path")
         if finetune_path and Path(finetune_path).exists():
             self.logger.info(
@@ -844,18 +472,32 @@ class Trainer:
                 self.ema.shadow = checkpoint["ema_state_dict"]
                 self.logger.info("Loaded EMA state from checkpoint.")
 
-            if "scheduler_state_dict" in checkpoint:
+            checkpoint_epochs = checkpoint.get("config", {}).get(
+                "num_epochs", self.config["num_epochs"]
+            )
+            epochs_changed = checkpoint_epochs != self.config["num_epochs"]
+
+            if "scheduler_state_dict" in checkpoint and not epochs_changed:
                 try:
                     self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-
                     self.scheduler.last_epoch = self.global_step
-
                     self.logger.info(
-                        f"Loaded scheduler state. Step disinkronkan ke: {self.global_step}."
+                        f"Loaded scheduler state. Step synchronized to: {self.global_step}."
                     )
                 except Exception as e:
                     self.logger.warning(
-                        f"Gagal load scheduler: {e}. Resetting scheduler ke awal (Warmup)."
+                        f"Failed to load scheduler: {e}. Resetting scheduler to warmup phase."
+                    )
+            else:
+                if epochs_changed:
+                    self.logger.warning(
+                        f"⚠️  num_epochs changed: {checkpoint_epochs} → {self.config['num_epochs']}"
+                    )
+                    self.logger.warning(
+                        f"⚠️  Scheduler NOT loaded from checkpoint (will start from warmup phase)"
+                    )
+                    self.logger.warning(
+                        f"⚠️  For stable LR fine-tuning, consider using scheduler='cosine_restarts'"
                     )
 
             self.logger.info(
@@ -872,6 +514,7 @@ class Trainer:
             self.global_step = 0
 
     def save_checkpoint(self, epoch, is_best=False):
+        """Save model checkpoint."""
         model_state_dict = (
             self.generator._orig_mod.state_dict()
             if hasattr(self.generator, "_orig_mod")
@@ -902,37 +545,8 @@ class Trainer:
         if is_best:
             torch.save(checkpoint, self.checkpoint_dir / "best_model.pth")
 
-    def compute_combined_loss(self, pred, target, current_epoch):
-        loss_dict = {}
-        total_loss = torch.tensor(0.0, device=self.device)
-
-        l1_weight = self.config.get("l1_weight", 1.0)
-        if l1_weight > 0:
-            l1_loss = self.l1_loss(pred, target)
-            total_loss += l1_weight * l1_loss
-            loss_dict["l1"] = l1_loss.item()
-
-        lpips_weight = self.config.get("lpips_weight", 0.0)
-        if self.lpips_metric and lpips_weight > 0:
-            lpips_loss = self.lpips_metric(pred * 2 - 1, target * 2 - 1).mean()
-            total_loss += lpips_weight * lpips_loss
-            loss_dict["lpips"] = lpips_loss.item()
-
-        fft_weight = self.config.get("fft_weight", 0.0)
-        if fft_weight > 0:
-            pred_fft = torch.fft.fft2(pred, dim=(-2, -1))
-            target_fft = torch.fft.fft2(target, dim=(-2, -1))
-            fft_loss = F.l1_loss(pred_fft.real, target_fft.real) + F.l1_loss(
-                pred_fft.imag, target_fft.imag
-            )
-            total_loss += fft_weight * fft_loss
-            loss_dict["fft"] = fft_loss.item()
-
-        loss_dict["total_recon"] = total_loss.item()
-
-        return total_loss, loss_dict
-
     def train_epoch(self, epoch):
+        """Train for one epoch."""
         check_gpu_temp(self.device, threshold=82, delay=15)
 
         self.generator.train()
@@ -940,8 +554,12 @@ class Trainer:
             self.discriminator.train()
 
         accumulation_steps = self.config.get("accumulation_steps", 1)
-        ohem_percent = self._get_current_ohem_percent(epoch)
-        if epoch == 0 or self._get_current_ohem_percent(epoch - 1) != ohem_percent:
+        ohem_percent = TrainerUtils.get_current_ohem_percent(epoch, self.config)
+        if (
+            epoch == 0
+            or TrainerUtils.get_current_ohem_percent(epoch - 1, self.config)
+            != ohem_percent
+        ):
             self.logger.info(
                 f"🔥 OHEM percentage for this epoch set to: {ohem_percent*100}%"
             )
@@ -1054,7 +672,6 @@ class Trainer:
             total_loss_G_epoch += total_loss_G.item()
 
             if (batch_idx + 1) % accumulation_steps == 0:
-
                 if self.config.get("use_gan"):
                     if self.config.get("grad_clip", 0) > 0:
                         self.scaler_D.unscale_(self.optimizer_D)
@@ -1114,7 +731,7 @@ class Trainer:
                     f"Global Step: {self.global_step}"
                 )
 
-            if batch_idx % 20 == 0:
+            if batch_idx % 10 == 0:
                 check_gpu_temp(self.device)
 
         avg_loss_G = total_loss_G_epoch / len(self.train_loader)
@@ -1122,6 +739,7 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, epoch):
+        """Validate the model."""
         self.generator.eval()
 
         if self.config.get("use_ema"):
@@ -1186,6 +804,7 @@ class Trainer:
         return avg_psnr.item(), avg_ssim.item(), lpips_score
 
     def save_sample_images(self, epoch):
+        """Save sample validation images."""
         self.generator.eval()
 
         try:
@@ -1257,6 +876,7 @@ class Trainer:
 
     @torch.no_grad()
     def calculate_lpips_on_subset(self, num_batches=4):
+        """Calculate LPIPS score on a subset of validation data."""
         if not self.lpips_metric:
             return None
 
@@ -1334,6 +954,7 @@ class Trainer:
         )
 
     def train(self) -> Optional[Tuple[float, float]]:
+        """Main training loop."""
         self.logger.info("=" * 80)
         self.logger.info("Starting Training Session")
         self.logger.info("=" * 80)
@@ -1344,8 +965,6 @@ class Trainer:
         self.logger.info(f"Device: {self.device}")
         self.logger.info(f"Model: {self.generator.__class__.__name__}")
         self.logger.info(f"Task Type: {self.config.get('task_type', 'N/A')}")
-        self.logger.info("")
-
         self.logger.info("Training Parameters:")
         self.logger.info(f"  Epochs: {self.config['num_epochs']}")
         self.logger.info(
@@ -1358,7 +977,6 @@ class Trainer:
         self.logger.info(f"  Weight Decay: {self.config.get('weight_decay', 1e-4):.2e}")
         self.logger.info(f"  Scheduler: {self.config.get('scheduler', 'onecycle')}")
         self.logger.info(f"  Gradient Clipping: {self.config.get('grad_clip', 0)}")
-        self.logger.info("")
 
         self.logger.info("Model Architecture:")
         self.logger.info(f"  Base Channels: {self.config.get('base_channels', 'N/A')}")
@@ -1366,8 +984,6 @@ class Trainer:
         self.logger.info(
             f"  Enhanced Architecture: {fmt_bool(self.config.get('use_enhanced_architecture', False))}"
         )
-        self.logger.info("")
-
         self.logger.info("Training Techniques:")
         self.logger.info(
             f"  AMP (Mixed Precision): {fmt_bool(self.config.get('use_amp', True))}"
@@ -1384,8 +1000,6 @@ class Trainer:
         self.logger.info(
             f"  Gradient Checkpointing: {fmt_bool(self.config.get('use_checkpointing', False))}"
         )
-        self.logger.info("")
-
         self.logger.info("Loss Configuration:")
         self.logger.info(f"  L1 Loss Weight: {self.config.get('l1_weight', 0)}")
         self.logger.info(f"  LPIPS Loss Weight: {self.config.get('lpips_weight', 0)}")
@@ -1398,8 +1012,6 @@ class Trainer:
         self.logger.info(
             f"  Sharpness Loss: {fmt_bool(self.config.get('use_sharpness_loss', False))}"
         )
-        self.logger.info("")
-
         self.logger.info("Data Augmentation:")
         self.logger.info(
             f"  Robust Degradation: {fmt_bool(self.config.get('use_robust_degradation', False))}"
@@ -1414,8 +1026,6 @@ class Trainer:
             self.logger.info(
                 f"  Vertical Flip: {fmt_bool(self.config.get('use_vertical_flip', False))}"
             )
-        self.logger.info("")
-
         self.logger.info("Image Settings:")
         self.logger.info(
             f"  Image Size: {self.config['img_height']}x{self.config['img_width']}"
@@ -1426,14 +1036,16 @@ class Trainer:
         self.logger.info(
             f"  Mosaic Opacity: {opacity_range[0]:.1f}-{opacity_range[1]:.1f}"
         )
-        self.logger.info("")
 
         ohem_schedule = self.config.get("ohem_schedule", [])
         if ohem_schedule:
             self.logger.info("OHEM Schedule:")
-            for epoch_num, percent in ohem_schedule:
-                self.logger.info(f"  Epoch {epoch_num}: {percent*100:.0f}%")
-            self.logger.info("")
+            num_epochs = self.config["num_epochs"]
+            for epoch_ratio, percent in ohem_schedule:
+                actual_epoch = int(epoch_ratio * num_epochs)
+                self.logger.info(
+                    f"  Epoch {actual_epoch} ({epoch_ratio*100:.1f}% of training): {percent*100:.0f}%"
+                )
 
         self.logger.info("Checkpoint & Early Stopping:")
         self.logger.info(
@@ -1527,16 +1139,3 @@ class Trainer:
         self.writer.close()
 
         return self.best_lpips, training_time
-
-    def _get_current_ohem_percent(self, epoch: int) -> float:
-        schedule = self.config.get("ohem_schedule", [])
-        if not schedule:
-            return self.config.get("ohem_percent", 1.0)
-
-        current_percent = self.config.get("ohem_percent", 1.0)
-        for schedule_epoch, percent in sorted(schedule, key=lambda x: x[0]):
-            if epoch >= schedule_epoch:
-                current_percent = percent
-            else:
-                break
-        return current_percent

@@ -39,6 +39,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     config = deepcopy(TRAINING_CONFIG)
 
     if IS_FINETUNE_MODE:
+        """--- Fine-Tune Parameters ---"""
         logging.info("Using pre-trained model for fine-tuning.")
         config["finetune_checkpoint_path"] = PRETRAINED_MODEL_PATH
 
@@ -59,13 +60,14 @@ def objective(trial: optuna.trial.Trial) -> float:
         config["fft_weight"] = trial.suggest_float("fft_weight", 0.05, 0.3, log=True)
 
         config["num_epochs"] = 30
-        config["early_stopping_patience"] = 7
+        config["early_stopping_patience"] = config["num_epochs"] // 2
     else:
+        """--- From Scratch Parameters ---"""
         logging.info("Using scratch training.")
         config["finetune_checkpoint_path"] = None
 
         config["learning_rate"] = trial.suggest_float(
-            "learning_rate", 1e-4, 5e-4, log=True
+            "learning_rate", 1e-4, 3e-4, log=True
         )
         config["weight_decay"] = trial.suggest_float(
             "weight_decay", 1e-6, 1e-3, log=True
@@ -83,11 +85,9 @@ def objective(trial: optuna.trial.Trial) -> float:
         config["num_epochs"] = 50
         config["early_stopping_patience"] = 10
 
-    # --- Optimizer Parameters ---
-
     config["grad_clip"] = trial.suggest_float("grad_clip", 0.5, 2.0)
 
-    # --- GAN Parameters ---
+    """--- GAN Parameters ---"""
     use_gan = True  # trial.suggest_categorical("use_gan", [True, False])
     config["use_gan"] = use_gan
     if use_gan:
@@ -196,8 +196,9 @@ def objective(trial: optuna.trial.Trial) -> float:
 
 
 if __name__ == "__main__":
+    """Minimize LPIPS"""
     study = optuna.create_study(
-        direction="minimize",  # Minimize LPIPS
+        direction="minimize",
         sampler=optuna.samplers.TPESampler(),
         pruner=optuna.pruners.MedianPruner(),
         study_name=STUDY_NAME,
