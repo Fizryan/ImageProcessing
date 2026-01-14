@@ -14,7 +14,7 @@ from PIL import Image
 from torch.amp.grad_scaler import GradScaler
 from torch.amp.autocast_mode import autocast
 from torch.utils.tensorboard.writer import SummaryWriter
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torchmetrics.image import (
     PeakSignalNoiseRatio,
     StructuralSimilarityIndexMeasure,
@@ -31,7 +31,7 @@ from program.Losses import (
     LightPerceptualLoss,
 )
 from program.Augmentation import RobustDegradation
-from program.RestorationDataset import RestorationDataset, RandomScale
+from program.RestorationDataset import RestorationDataset, RandomScale, ExternalDataset
 from program.ModelEMA import ModelEMA
 from program.TrainerUtils import TrainerUtils
 from program.LoggingSetup import setup_logger, fmt_bool
@@ -353,6 +353,20 @@ class Trainer:
             robust_degradation=dataset_robust_degradation,
         )
 
+        train_external_dir = self.config.get("train_external_dir")
+        if train_external_dir and Path(train_external_dir).exists():
+            external_dataset = ExternalDataset(
+                external_dir=Path(train_external_dir),
+                clean_dir=Path(self.config["train_clean_dir"]),
+                image_size=image_size,
+                transform=train_transform,
+                keep_original_size=False,
+            )
+            self.train_dataset = ConcatDataset([self.train_dataset, external_dataset])
+            self.logger.info(
+                f"Added {len(external_dataset)} external images to training dataset"
+            )
+
         self.val_dataset = RestorationDataset(
             Path(self.config["val_clean_dir"]),
             Path(self.config["val_mask_dir"]),
@@ -368,6 +382,20 @@ class Trainer:
             use_mosaic_grid_shift=False,
             robust_degradation=None,
         )
+
+        val_external_dir = self.config.get("val_external_dir")
+        if val_external_dir and Path(val_external_dir).exists():
+            val_external_dataset = ExternalDataset(
+                external_dir=Path(val_external_dir),
+                clean_dir=Path(self.config["val_clean_dir"]),
+                image_size=image_size,
+                transform=None,
+                keep_original_size=True,
+            )
+            self.val_dataset = ConcatDataset([self.val_dataset, val_external_dataset])
+            self.logger.info(
+                f"Added {len(val_external_dataset)} external images to validation dataset"
+            )
 
         self.train_loader = DataLoader(
             self.train_dataset,

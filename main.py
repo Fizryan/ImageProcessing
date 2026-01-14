@@ -16,12 +16,13 @@ def display_menu():
     print("=" * 70)
     print("📂  Data Preparation")
     print("    1. Resize Images")
+    print("    2. Add Mosaic/Degradation")
     print("🎯  Training")
-    print("    2. Train Demosaic Model")
-    print("    3. Train Inpainting Model")
+    print("    3. Train Demosaic Model")
+    print("    4. Train Inpainting Model")
     print("🔮  Inference")
-    print("    4. Image Restoration (Single/Batch)")
-    print("    5. Video Restoration")
+    print("    5. Image Restoration (Single/Batch)")
+    print("    6. Video Restoration")
     print("\n👋  Exit")
     print("    0. Exit")
     print("=" * 70)
@@ -42,10 +43,11 @@ def main():
 
     menu_actions = {
         "1": ("Resize Images", MenuHandlers.handle_resize),
-        "2": ("Train Demosaic Model", MenuHandlers.handle_training),
-        "3": ("Train Inpainting Model", MenuHandlers.handle_inpainting_training),
-        "4": ("Image Restoration", MenuHandlers.handle_image_restoration),
-        "5": ("Video Restoration", MenuHandlers.handle_video_restoration),
+        "2": ("Add Mosaic/Degradation", MenuHandlers.handle_add_mosaic),
+        "3": ("Train Demosaic Model", MenuHandlers.handle_training),
+        "4": ("Train Inpainting Model", MenuHandlers.handle_inpainting_training),
+        "5": ("Image Restoration", MenuHandlers.handle_image_restoration),
+        "6": ("Video Restoration", MenuHandlers.handle_video_restoration),
     }
 
     while True:

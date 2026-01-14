@@ -10,6 +10,7 @@ from program.Training import Trainer
 from program.Inference import ImageRestorer
 from program.Inference_Video import VideoRestorer
 from program.Training_Config import TRAINING_CONFIG
+from program.MosaicGenerator import MosaicGenerator
 
 logger = setup_logger(__name__)
 
@@ -164,3 +165,76 @@ class MenuHandlers:
             show_preview=show_preview,
             merge_audio=merge_audio,
         )
+
+    @staticmethod
+    def handle_add_mosaic():
+        """Handle mosaic/degradation generation process."""
+        logger.info("Starting mosaic generation process...")
+
+        clean_dir = InputValidator.get_path_input(
+            "Clean images directory",
+            "dataset/train/clean_images",
+            must_exist=True,
+        )
+        mask_dir = InputValidator.get_path_input(
+            "Mask images directory",
+            "dataset/train/mask_images",
+            must_exist=True,
+        )
+        output_dir = InputValidator.get_user_input(
+            "Output directory", "dataset/train/external_images"
+        )
+
+        print("\nSelect degradation type:")
+        print("  1. Demosaic (pixelated mosaic)")
+        print("  2. Inpainting (white mask overlay)")
+        task_choice = InputValidator.get_user_input("Choice", "1")
+        task_type = "inpainting" if task_choice == "2" else "demosaic"
+
+        if task_type == "demosaic":
+            min_block = InputValidator.get_numeric_range(
+                "Minimum block size", 4, 128, 20, int
+            )
+            max_block = InputValidator.get_numeric_range(
+                "Maximum block size", min_block, 128, 60, int
+            )
+            mosaic_block_size_range = (min_block, max_block)
+
+            min_opacity = InputValidator.get_numeric_range(
+                "Minimum opacity", 0.0, 1.0, 1.0, float
+            )
+            max_opacity = InputValidator.get_numeric_range(
+                "Maximum opacity", min_opacity, 1.0, 1.0, float
+            )
+            mosaic_opacity_range = (min_opacity, max_opacity)
+
+            use_grid_shift = InputValidator.confirm_action(
+                "Use random grid shift?", default=True
+            )
+
+            use_robust_degradation = InputValidator.confirm_action(
+                "Add blur/noise/JPEG artifacts?", default=False
+            )
+        else:
+            mosaic_block_size_range = (16, 16)
+            mosaic_opacity_range = (1.0, 1.0)
+            use_grid_shift = False
+            use_robust_degradation = False
+
+        DirectoryManager.ensure_output_directory(output_dir)
+
+        generator = MosaicGenerator(
+            clean_dir=str(clean_dir),
+            mask_dir=str(mask_dir),
+            output_dir=output_dir,
+            task_type=task_type,
+            mosaic_block_size_range=mosaic_block_size_range,
+            mosaic_opacity_range=mosaic_opacity_range,
+            use_mosaic_grid_shift=use_grid_shift,
+            use_robust_degradation=use_robust_degradation,
+        )
+
+        success, failed = generator.process_all()
+        print(f"\n✓ Generated {success} degraded images")
+        if failed > 0:
+            print(f"⚠ Failed to process {failed} images")

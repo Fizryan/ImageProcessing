@@ -56,6 +56,93 @@ class RandomScale:
         return img.resize((new_w, new_h), Image.Resampling.BILINEAR)
 
 
+class ExternalDataset(Dataset):
+    """
+    Dataset for externally/manually degraded images.
+    No automatic degradation is applied - images are used as-is.
+    External images are paired with clean images for training.
+    """
+
+    def __init__(
+        self,
+        external_dir: Path,
+        clean_dir: Path,
+        image_size: Tuple[int, int],
+        transform=None,
+        keep_original_size=False,
+    ):
+        """
+        Args:
+            external_dir: Directory containing manually degraded images
+            clean_dir: Directory containing clean target images
+            image_size: Target image size (height, width)
+            transform: Optional transforms to apply
+            keep_original_size: If True, don't resize images
+        """
+        self.external_paths = sorted(
+            [
+                p
+                for p in external_dir.iterdir()
+                if p.suffix.lower() in [".png", ".jpg", ".jpeg"]
+            ]
+        )
+        self.clean_dir = clean_dir
+        self.image_size = image_size
+        self.transform = transform
+        self.keep_original_size = keep_original_size
+
+        logger.info(
+            f"ExternalDataset: Found {len(self.external_paths)} external images"
+        )
+
+    def __len__(self):
+        return len(self.external_paths)
+
+    def __getitem__(self, idx):
+        external_path = self.external_paths[idx]
+        clean_path = self.clean_dir / external_path.name
+
+        try:
+            # Load externally degraded image (input)
+            external_img = Image.open(external_path).convert("RGB")
+            # Load clean image (target)
+            clean_img = Image.open(clean_path).convert("RGB")
+
+            if not self.keep_original_size:
+                if self.transform:
+                    # Apply same transform to both images
+                    seed = torch.randint(0, 2**32, (1,)).item()
+                    torch.manual_seed(seed)
+                    random.seed(seed)
+                    external_tensor = self.transform(external_img)
+                    torch.manual_seed(seed)
+                    random.seed(seed)
+                    clean_tensor = self.transform(clean_img)
+                else:
+                    external_tensor = transforms.ToTensor()(external_img)
+                    clean_tensor = transforms.ToTensor()(clean_img)
+                    external_tensor = transforms.functional.resize(
+                        external_tensor, self.image_size
+                    )
+                    clean_tensor = transforms.functional.resize(
+                        clean_tensor, self.image_size
+                    )
+            else:
+                external_tensor = transforms.ToTensor()(external_img)
+                clean_tensor = transforms.ToTensor()(clean_img)
+
+            return external_tensor, clean_tensor
+
+        except FileNotFoundError:
+            logger.warning(f"Clean image not found for {external_path.name}, skipping.")
+            new_idx = (idx + 1) % len(self)
+            return self.__getitem__(new_idx)
+        except Exception as e:
+            logger.warning(f"Error processing {external_path.name}: {e}, skipping.")
+            new_idx = (idx + 1) % len(self)
+            return self.__getitem__(new_idx)
+
+
 class RestorationDataset(Dataset):
     """
     Dataset for image restoration tasks (demosaic, inpainting).
