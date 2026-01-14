@@ -20,9 +20,8 @@ TRAINING_CONFIG = {
     "val_clean_dir": "dataset/validation/clean_images",
     "train_mask_dir": "dataset/train/mask_images",
     "val_mask_dir": "dataset/validation/mask_images",
-    # External dataset (manually degraded images - no auto degradation applied)
-    "train_external_dir": "dataset/train/external_images",  # e.g., "dataset/train/external_images"
-    "val_external_dir": "dataset/validation/external_images",  # e.g., "dataset/validation/external_images"
+    "train_external_dir": "dataset/train/external_images",
+    "val_external_dir": "dataset/validation/external_images",
     "img_height": 256,
     "img_width": 256,
     # --- DataLoader ---

@@ -103,14 +103,11 @@ class ExternalDataset(Dataset):
         clean_path = self.clean_dir / external_path.name
 
         try:
-            # Load externally degraded image (input)
             external_img = Image.open(external_path).convert("RGB")
-            # Load clean image (target)
             clean_img = Image.open(clean_path).convert("RGB")
 
             if not self.keep_original_size:
                 if self.transform:
-                    # Apply same transform to both images
                     seed = torch.randint(0, 2**32, (1,)).item()
                     torch.manual_seed(seed)
                     random.seed(seed)
