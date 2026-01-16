@@ -20,8 +20,8 @@ TRAINING_CONFIG = {
     "val_clean_dir": "dataset/validation/clean_images",
     "train_mask_dir": "dataset/train/mask_images",
     "val_mask_dir": "dataset/validation/mask_images",
-    "train_external_dir": "dataset/train/external_images",
-    "val_external_dir": "dataset/validation/external_images",
+    "train_external_dir": None,  # "dataset/train/external_images",
+    "val_external_dir": None,  # "dataset/validation/external_images",
     "img_height": 256,
     "img_width": 256,
     # --- DataLoader ---
@@ -32,7 +32,7 @@ TRAINING_CONFIG = {
         "pin_memory": True,
         "persistent_workers": True,
     },
-    "val_batch_size": 2,
+    "val_batch_size": 4,
     # --- Optimizer & Scheduler ---
     "learning_rate": 2e-4,
     "weight_decay": 1e-4,
@@ -68,7 +68,7 @@ TRAINING_CONFIG = {
     "fft_weight": 0.05,
     "use_sharpness_loss": False,
     "use_enhanced_architecture": True,
-    "use_robust_degradation": True,
+    "use_robust_degradation": False,
     "robust_degradation_prob": 0.5,
     "robust_degradation_config": {
         "blur_prob": 0.3,

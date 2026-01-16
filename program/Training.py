@@ -337,23 +337,41 @@ class Trainer:
         if self.config.get("use_robust_degradation", False):
             dataset_robust_degradation = RobustDegradation(self.config)
 
-        self.train_dataset = RestorationDataset(
-            Path(self.config["train_clean_dir"]),
-            Path(self.config["train_mask_dir"]),
-            image_size,
-            transform=train_transform,
-            mosaic_block_size_range=self.config.get(
-                "mosaic_block_size_range", [16, 16]
-            ),
-            mosaic_opacity_range=self.config.get("mosaic_opacity_range", [1.0, 1.0]),
-            use_masks=self.config.get("use_masks", True),
-            task_type=self.config.get("task_type", "demosaic"),
-            keep_original_size=False,
-            use_mosaic_grid_shift=self.config.get("use_mosaic_grid_shift", False),
-            robust_degradation=dataset_robust_degradation,
-        )
-
+        train_mask_dir = self.config.get("train_mask_dir")
+        val_mask_dir = self.config.get("val_mask_dir")
         train_external_dir = self.config.get("train_external_dir")
+        val_external_dir = self.config.get("val_external_dir")
+
+        train_datasets = []
+        val_datasets = []
+
+        if train_mask_dir and Path(train_mask_dir).exists():
+            restoration_train_dataset = RestorationDataset(
+                Path(self.config["train_clean_dir"]),
+                Path(train_mask_dir),
+                image_size,
+                transform=train_transform,
+                mosaic_block_size_range=self.config.get(
+                    "mosaic_block_size_range", [16, 16]
+                ),
+                mosaic_opacity_range=self.config.get(
+                    "mosaic_opacity_range", [1.0, 1.0]
+                ),
+                use_masks=self.config.get("use_masks", True),
+                task_type=self.config.get("task_type", "demosaic"),
+                keep_original_size=False,
+                use_mosaic_grid_shift=self.config.get("use_mosaic_grid_shift", False),
+                robust_degradation=dataset_robust_degradation,
+            )
+            train_datasets.append(restoration_train_dataset)
+            self.logger.info(
+                f"RestorationDataset (train): {len(restoration_train_dataset)} images with auto-mosaic"
+            )
+        else:
+            self.logger.info(
+                "No train_mask_dir provided - skipping auto-mosaic dataset (using external images only)"
+            )
+
         if train_external_dir and Path(train_external_dir).exists():
             external_dataset = ExternalDataset(
                 external_dir=Path(train_external_dir),
@@ -362,28 +380,47 @@ class Trainer:
                 transform=train_transform,
                 keep_original_size=False,
             )
-            self.train_dataset = ConcatDataset([self.train_dataset, external_dataset])
+            train_datasets.append(external_dataset)
             self.logger.info(
-                f"Added {len(external_dataset)} external images to training dataset"
+                f"ExternalDataset (train): {len(external_dataset)} manually degraded images"
             )
 
-        self.val_dataset = RestorationDataset(
-            Path(self.config["val_clean_dir"]),
-            Path(self.config["val_mask_dir"]),
-            image_size,
-            transform=None,
-            mosaic_block_size_range=self.config.get(
-                "mosaic_block_size_range", [16, 16]
-            ),
-            mosaic_opacity_range=self.config.get("mosaic_opacity_range", [1.0, 1.0]),
-            use_masks=self.config.get("use_masks", True),
-            task_type=self.config.get("task_type", "demosaic"),
-            keep_original_size=True,
-            use_mosaic_grid_shift=False,
-            robust_degradation=None,
-        )
+        if len(train_datasets) == 0:
+            raise ValueError(
+                "No training data available. Please provide either train_mask_dir or train_external_dir."
+            )
+        elif len(train_datasets) == 1:
+            self.train_dataset = train_datasets[0]
+        else:
+            self.train_dataset = ConcatDataset(train_datasets)
 
-        val_external_dir = self.config.get("val_external_dir")
+        if val_mask_dir and Path(val_mask_dir).exists():
+            restoration_val_dataset = RestorationDataset(
+                Path(self.config["val_clean_dir"]),
+                Path(val_mask_dir),
+                image_size,
+                transform=None,
+                mosaic_block_size_range=self.config.get(
+                    "mosaic_block_size_range", [16, 16]
+                ),
+                mosaic_opacity_range=self.config.get(
+                    "mosaic_opacity_range", [1.0, 1.0]
+                ),
+                use_masks=self.config.get("use_masks", True),
+                task_type=self.config.get("task_type", "demosaic"),
+                keep_original_size=True,
+                use_mosaic_grid_shift=False,
+                robust_degradation=None,
+            )
+            val_datasets.append(restoration_val_dataset)
+            self.logger.info(
+                f"RestorationDataset (val): {len(restoration_val_dataset)} images with auto-mosaic"
+            )
+        else:
+            self.logger.info(
+                "No val_mask_dir provided - skipping auto-mosaic dataset for validation"
+            )
+
         if val_external_dir and Path(val_external_dir).exists():
             val_external_dataset = ExternalDataset(
                 external_dir=Path(val_external_dir),
@@ -392,10 +429,19 @@ class Trainer:
                 transform=None,
                 keep_original_size=True,
             )
-            self.val_dataset = ConcatDataset([self.val_dataset, val_external_dataset])
+            val_datasets.append(val_external_dataset)
             self.logger.info(
-                f"Added {len(val_external_dataset)} external images to validation dataset"
+                f"ExternalDataset (val): {len(val_external_dataset)} manually degraded images"
             )
+
+        if len(val_datasets) == 0:
+            raise ValueError(
+                "No validation data available. Please provide either val_mask_dir or val_external_dir."
+            )
+        elif len(val_datasets) == 1:
+            self.val_dataset = val_datasets[0]
+        else:
+            self.val_dataset = ConcatDataset(val_datasets)
 
         self.train_loader = DataLoader(
             self.train_dataset,
