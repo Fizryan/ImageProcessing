@@ -1,5 +1,6 @@
 import os
 
+VERSION = "V1"
 BASE_DIR = "database"
 
 VER_PATH = f"/{VERSION}" if VERSION else ""
