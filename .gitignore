@@ -1,16 +1,6 @@
-# .gitignore for ImageProcessing
-
-# Files and directories to ignore in the ImageProcessing
-/dataset
-/Training
-/logs
-/Results
-/Samples
-/Models
-/Testing
-
 # Python virtual environment
 venv/
+env
 .env
 /venv
 .vscode
