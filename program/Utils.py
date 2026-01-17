@@ -1,13 +1,20 @@
 import time
 import torch
+from typing import Optional, List, Union
+
 from program.LoggingManager import LoggingManager
 
-try:
-    from GPUtil import getGPUs
-except ImportError:
-    getGPUs = None
-
 logger = LoggingManager.setup_logging(__name__)
+
+try:
+    import GPUtil
+
+    HAS_GPUTIL = True
+except ImportError:
+    HAS_GPUTIL = False
+    logger.warning(
+        "GPUtil module not found. GPU monitoring/throttling will be disabled."
+    )
 
 
 class Utils:
@@ -15,51 +22,80 @@ class Utils:
         raise RuntimeError("Utils is a static class")
 
     @staticmethod
-    def get_gpu_info():
-        if getGPUs:
-            try:
-                gpus = getGPUs()
-                for gpu in gpus:
-                    logger.info(f"GPU: {gpu.name}")
-                    logger.info(f"Load: {gpu.load * 100}%")
-                    logger.info(f"Memory: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB")
-                    logger.info(f"Temperature: {gpu.temperature}°C")
-                    logger.info(f"GPU Utilization: {gpu.gpuUtil * 100}%")
-                    logger.info(f"Memory Utilization: {gpu.memoryUtil * 100}%")
-            except Exception as e:
-                logger.error(f"Error getting GPU info: {e}")
+    def _get_target_gpu_id(device: torch.device) -> int:
+        if device.type != "cuda":
+            return -1
+        return device.index if device.index is not None else 0
 
     @staticmethod
-    def get_gpu_load():
-        if getGPUs:
-            try:
-                gpu = getGPUs()[0]
-                return gpu.load
-            except Exception as e:
-                logger.error(f"Error getting GPU load: {e}")
-                return 0.0
-
-    @staticmethod
-    def get_gpu_memory_usage():
-        if getGPUs:
-            try:
-                gpu = getGPUs()[0]
-                return gpu.memoryUsed
-            except Exception as e:
-                logger.error(f"Error getting GPU memory usage: {e}")
-                return 0.0
-
-    @staticmethod
-    def check_gpu_temp(device: torch.device, threshold: float = 84, delay: int = 15):
-        if not getGPUs or device.type != "cuda":
+    def get_gpu_info(device: Optional[torch.device] = None) -> None:
+        if not HAS_GPUTIL:
             return
 
         try:
-            gpu = getGPUs()[0]
-            temp: float = gpu.temperature
-            if temp >= threshold + 4:
-                time.sleep(delay * 2)
-            elif temp >= threshold:
-                time.sleep(delay)
+            gpus = GPUtil.getGPUs()
+            target_id = Utils._get_target_gpu_id(device) if device else -1
+
+            for gpu in gpus:
+                if target_id != -1 and gpu.id != target_id:
+                    continue
+
+                logger.info(f"--- GPU {gpu.id}: {gpu.name} ---")
+                logger.info(
+                    f"   Load: {gpu.load * 100:.1f}% | Temp: {gpu.temperature}°C"
+                )
+                logger.info(
+                    f"   VRAM: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB ({gpu.memoryUtil * 100:.1f}%)"
+                )
+
         except Exception as e:
-            logger.error(f"Error checking GPU temperature: {e}")
+            logger.error(f"Failed to retrieve GPU Info: {e}")
+
+    @staticmethod
+    def get_vram_usage(device: torch.device) -> str:
+        if not HAS_GPUTIL or device.type != "cuda":
+            return "N/A"
+
+        try:
+            target_id = Utils._get_target_gpu_id(device)
+            target_gpu = next((g for g in GPUtil.getGPUs() if g.id == target_id), None)
+
+            if target_gpu:
+                return f"{int(target_gpu.memoryUsed)}/{int(target_gpu.memoryTotal)} MB"
+        except Exception:
+            pass
+        return "N/A"
+
+    @staticmethod
+    def check_gpu_temp(
+        device: torch.device, threshold: float = 80.0, delay: int = 30
+    ) -> None:
+        if not HAS_GPUTIL or device.type != "cuda":
+            return
+
+        try:
+            target_id = Utils._get_target_gpu_id(device)
+            target_gpu = next((g for g in GPUtil.getGPUs() if g.id == target_id), None)
+
+            if not target_gpu:
+                return
+
+            temp = target_gpu.temperature
+
+            if temp >= threshold + 5:
+                logger.warning(
+                    f"CRITICAL GPU TEMP: {temp}°C (Limit: {threshold + 5}°C). "
+                    f"Throttling execution for {delay * 2}s to cool down..."
+                )
+                time.sleep(delay * 2)
+                logger.info(f"Resuming execution. Temp check passed.")
+
+            elif temp >= threshold:
+                logger.warning(
+                    f"HIGH GPU TEMP: {temp}°C (Limit: {threshold}°C). "
+                    f"Pausing for {delay}s..."
+                )
+                time.sleep(delay)
+
+        except Exception as e:
+            logger.error(f"Error monitoring GPU temp: {e}")
