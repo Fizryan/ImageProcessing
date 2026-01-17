@@ -5,8 +5,11 @@ env
 /venv
 .vscode
 
+database/
+
 # log files
 *.log
+logs/
 
 # Temporary files
 *.tmp

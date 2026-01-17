@@ -18,7 +18,7 @@ MAIN_PATHS = {
     "logs": f"{RESULTS_ROOT}/logs",
 }
 
-USE_MASK = False
+USE_MASK = True
 
 DIRECTORIES_CONFIG = {
     "checkpoint_dir": f"{MAIN_PATHS['models']}/checkpoints",
