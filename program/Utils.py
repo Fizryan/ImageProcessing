@@ -52,6 +52,25 @@ class Utils:
             logger.error(f"Failed to retrieve GPU Info: {e}")
 
     @staticmethod
+    def get_gpu_load(device: Optional[torch.device] = None) -> Optional[float]:
+        if not HAS_GPUTIL:
+            return None
+
+        try:
+            gpus = GPUtil.getGPUs()
+            target_id = Utils._get_target_gpu_id(device) if device else -1
+
+            for gpu in gpus:
+                if target_id != -1 and gpu.id != target_id:
+                    continue
+
+                return gpu.load
+
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def get_vram_usage(device: torch.device) -> str:
         if not HAS_GPUTIL or device.type != "cuda":
             return "N/A"
