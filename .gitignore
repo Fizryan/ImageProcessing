@@ -7,6 +7,14 @@ env
 
 database/
 
+# Image
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.bmp
+*.gif
+
 # log files
 *.log
 logs/

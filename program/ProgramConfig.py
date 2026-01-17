@@ -15,7 +15,7 @@ MAIN_PATHS = {
     "val_dir": f"{DATASET_ROOT}/val",
     "models": MODELS_ROOT,
     "tensorboard": f"{RESULTS_ROOT}/tensorboard",
-    "logs": f"{RESULTS_ROOT}/logs",
+    "logs": f"logs",
 }
 
 USE_MASK = True
@@ -23,7 +23,7 @@ USE_MASK = True
 DIRECTORIES_CONFIG = {
     "checkpoint_dir": f"{MAIN_PATHS['models']}/checkpoints",
     "tensorboard_log_dir": MAIN_PATHS["tensorboard"],
-    "log_file": f"{MAIN_PATHS['logs']}/training.log",
+    "log_file": f"{MAIN_PATHS['logs']}/app.log",
     "train_clean_dir": f"{MAIN_PATHS['train_dir']}/clean_image",
     "train_mask_dir": f"{MAIN_PATHS['train_dir']}/mask_image" if USE_MASK else None,
     "train_external_dir": None,
@@ -48,16 +48,16 @@ HYPERPARAMETERS = {
         "batch_size": 4,
         "num_workers": 4,
         "persistent_workers": True,
-        "prefetch_factor": 2,
+        "prefetch_factor": 4,
     },
     "learning_rate": 3e-4,
     "weight_decay": 1e-4,
     "scheduler": "onecycle",
     "grad_clip": 1.0,
-    "accumulation_steps": 3,
+    "accumulation_steps": 2,
     "use_amp": True,
     "use_channels_last": True,
-    "use_checkpointing": True,
+    "use_checkpointing": False,
     "use_ema": True,
     "ema_decay": 0.9995,
     "compile_model": False,

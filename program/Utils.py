@@ -87,7 +87,7 @@ class Utils:
 
     @staticmethod
     def check_gpu_temp(
-        device: torch.device, threshold: float = 80.0, delay: int = 30
+        device: torch.device, threshold: float = 84.0, delay: int = 15
     ) -> None:
         if not HAS_GPUTIL or device.type != "cuda":
             return

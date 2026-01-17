@@ -78,7 +78,6 @@ class Trainer:
             logger.info(
                 f"Hardware optimization enabled on {torch.cuda.get_device_name(0)}"
             )
-            Utils.get_gpu_info(self.device)
 
     def _setup_directories(self):
         paths_to_create = [
@@ -97,23 +96,35 @@ class Trainer:
     def _setup_data(self):
         logger.info("Initializing DataLoaders...")
 
+        train_config = {
+            **self.config,
+            "clean_dir": self.config["train_clean_dir"],
+            "mask_dir": self.config.get("train_mask_dir"),
+            "mosaic_block": self.config.get("mosaic_block_size_range", (16, 16)),
+            "opacity": self.config.get("mosaic_opacity_range", (1.0, 1.0)),
+            "image_size": (self.config["img_height"], self.config["img_width"]),
+        }
+
         self.train_loader = get_dataloader(
             dataset_type="restoration",
-            config=self.config,
+            config=train_config,
             batch_size=self.config["dataloader_params"]["batch_size"],
             num_workers=self.config["dataloader_params"]["num_workers"],
             shuffle=True,
         )
 
+        val_config = {
+            **self.config,
+            "clean_dir": self.config["val_clean_dir"],
+            "mask_dir": self.config.get("val_mask_dir"),
+            "mosaic_block": (16, 16),
+            "opacity": (1.0, 1.0),
+            "image_size": (self.config["img_height"], self.config["img_width"]),
+        }
+
         self.val_loader = get_dataloader(
             dataset_type="restoration",
-            config={
-                **self.config,
-                "clean_dir": self.config["val_clean_dir"],
-                "mask_dir": self.config["val_mask_dir"],
-                "mosaic_block": (16, 16),
-                "opacity": (1.0, 1.0),
-            },
+            config=val_config,
             batch_size=1,
             num_workers=2,
             shuffle=False,
@@ -234,6 +245,7 @@ class Trainer:
             self.start_epoch = checkpoint["epoch"] + 1
             self.global_step = checkpoint.get("global_step", 0)
             self.best_psnr = checkpoint.get("best_psnr", 0.0)
+            self.best_lpips = checkpoint.get("best_lpips", float("inf"))
 
             logger.info(f"Resuming training from Epoch {self.start_epoch}")
 
@@ -255,6 +267,7 @@ class Trainer:
             "scaler_G_state_dict": self.scaler_G.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
             "best_psnr": self.best_psnr,
+            "best_lpips": self.best_lpips,
             "config": self.config,
         }
 
@@ -373,11 +386,42 @@ class Trainer:
                 )
 
                 self.writer.add_scalar("Loss/G_Total", loss_G.item(), self.global_step)
+
+                for loss_name, loss_value in loss_dict.items():
+                    if loss_name != "total":
+                        self.writer.add_scalar(
+                            f"Loss_Components/{loss_name}", loss_value, self.global_step
+                        )
+
                 if self.config.get("use_gan"):
                     self.writer.add_scalar("Loss/D_Total", loss_D_val, self.global_step)
+                    self.writer.add_scalar(
+                        "Loss_Components/gan_g",
+                        loss_dict.get("gan", 0),
+                        self.global_step,
+                    )
+
                 self.writer.add_scalar(
-                    "LR", self.scheduler.get_last_lr()[0], self.global_step
+                    "Training/LR", self.scheduler.get_last_lr()[0], self.global_step
                 )
+
+                if ohem_percent < 1.0:
+                    self.writer.add_scalar(
+                        "Training/OHEM_Percent", ohem_percent, self.global_step
+                    )
+
+                if batch_idx % 200 == 0 and self.device.type == "cuda":
+                    vram_used = torch.cuda.memory_allocated(self.device) / 1024**3
+                    vram_reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+                    self.writer.add_scalar(
+                        "System/VRAM_Used_GB", vram_used, self.global_step
+                    )
+                    self.writer.add_scalar(
+                        "System/VRAM_Reserved_GB", vram_reserved, self.global_step
+                    )
+
+        avg_epoch_loss = total_g_loss / len(self.train_loader)
+        self.writer.add_scalar("Epoch/Train_Loss_Avg", avg_epoch_loss, epoch)
 
     def _inference_tiled(self, img: torch.Tensor) -> torch.Tensor:
         patch_h, patch_w = 256, 448
@@ -418,7 +462,46 @@ class Trainer:
         return output_full[:, :, :h, :w]
 
     @torch.no_grad()
-    def validate(self, epoch: int) -> Tuple[float, float]:
+    def _calculate_lpips_subset(self, num_batches: int = 4) -> Optional[float]:
+        if not HAS_LPIPS or self.lpips_metric is None:
+            return None
+
+        torch.cuda.empty_cache()
+
+        total_lpips = 0.0
+        count = 0
+
+        loader_iter = iter(self.val_loader)
+
+        for _ in range(num_batches):
+            try:
+                degraded, clean = next(loader_iter)
+            except StopIteration:
+                break
+
+            degraded, clean = degraded.to(self.device), clean.to(self.device)
+
+            with autocast(
+                device_type=self.device.type, enabled=self.config.get("use_amp", True)
+            ):
+                if degraded.shape[2] > 512 or degraded.shape[3] > 512:
+                    scale = 0.5
+                    degraded = F.interpolate(
+                        degraded, scale_factor=scale, mode="bilinear"
+                    )
+                    clean = F.interpolate(clean, scale_factor=scale, mode="bilinear")
+
+                restored = self.generator(degraded).clamp(0, 1)
+
+                val = self.lpips_metric(restored * 2 - 1, clean * 2 - 1).mean()
+
+            total_lpips += val.item()
+            count += 1
+
+        return total_lpips / count if count > 0 else None
+
+    @torch.no_grad()
+    def validate(self, epoch: int) -> Tuple[float, float, Optional[float]]:
         self.generator.eval()
         if self.ema:
             self.ema.apply_shadow()
@@ -446,15 +529,20 @@ class Trainer:
         avg_psnr = total_psnr / len(self.val_loader)
         avg_ssim = total_ssim / len(self.val_loader)
 
+        subset_n = self.config.get("lpips_subset_batches", 4)
+        avg_lpips = self._calculate_lpips_subset(num_batches=subset_n)
+
         self.writer.add_scalar("Val/PSNR", avg_psnr, self.global_step)
         self.writer.add_scalar("Val/SSIM", avg_ssim, self.global_step)
+        if avg_lpips is not None:
+            self.writer.add_scalar("Val/LPIPS", avg_lpips, self.global_step)
 
         self._save_preview_to_tensorboard(epoch)
 
         if self.ema:
             self.ema.restore()
 
-        return avg_psnr, avg_ssim
+        return avg_psnr, avg_ssim, avg_lpips
 
     def _save_preview_to_tensorboard(self, epoch: int):
         try:
@@ -489,15 +577,25 @@ class Trainer:
             for epoch in range(self.start_epoch, self.config["num_epochs"]):
                 self.train_epoch(epoch)
 
-                psnr, ssim = self.validate(epoch)
+                psnr, ssim, lpips_val = self.validate(epoch)
+
+                lpips_str = f"{lpips_val:.4f}" if lpips_val is not None else "N/A"
 
                 logger.info(
-                    f"Epoch {epoch+1} Summary | PSNR: {psnr:.2f}dB | SSIM: {ssim:.4f}"
+                    f"Epoch {epoch+1} Summary | PSNR: {psnr:.2f}dB | SSIM: {ssim:.4f} | LPIPS: {lpips_str}"
                 )
 
-                is_best = psnr > self.best_psnr
-                if is_best:
+                is_best_psnr = psnr > self.best_psnr
+                is_best_lpips = lpips_val is not None and lpips_val < self.best_lpips
+                is_best = is_best_psnr or is_best_lpips
+
+                if is_best_psnr:
                     self.best_psnr = psnr
+                    logger.info(f"  → New Best PSNR: {psnr:.2f}dB")
+
+                if is_best_lpips:
+                    self.best_lpips = lpips_val
+                    logger.info(f"  → New Best LPIPS: {lpips_val:.4f}")
 
                 if (epoch + 1) % self.config.get("checkpoint_freq", 1) == 0 or is_best:
                     self._save_checkpoint(epoch, is_best)

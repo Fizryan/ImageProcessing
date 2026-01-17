@@ -106,7 +106,7 @@ class RestorationDataset(Dataset):
     def __init__(
         self,
         clean_dir: Path,
-        mask_dir: Path,
+        mask_dir: Optional[Path],
         image_size: Tuple[int, int],
         transform: Optional[Callable] = None,
         mosaic_block_size_range: Tuple[int, int] = (16, 16),
@@ -123,7 +123,7 @@ class RestorationDataset(Dataset):
                 if p.suffix.lower() in [".png", ".jpg", ".jpeg", ".webp"]
             ]
         )
-        self.mask_dir = Path(mask_dir)
+        self.mask_dir = Path(mask_dir) if mask_dir is not None else None
         self.image_size = image_size
         self.transform = transform
 
@@ -141,7 +141,12 @@ class RestorationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.clean_paths)
 
-    def _load_mask(self, mask_path: Path, target_shape: torch.Size) -> torch.Tensor:
+    def _load_mask(
+        self, mask_path: Optional[Path], target_shape: torch.Size
+    ) -> torch.Tensor:
+        if self.mask_dir is None or mask_path is None:
+            return torch.ones(1, target_shape[1], target_shape[2])
+
         try:
             mask_img = Image.open(mask_path).convert("L")
 
@@ -190,7 +195,9 @@ class RestorationDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         clean_path = self.clean_paths[idx]
-        mask_path = self.mask_dir / clean_path.name
+        mask_path = (
+            (self.mask_dir / clean_path.name) if self.mask_dir is not None else None
+        )
 
         try:
             clean_img = Image.open(clean_path).convert("RGB")
